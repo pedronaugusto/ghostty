@@ -273,7 +273,10 @@ extension NSApplication {
             return nil
         }
 
-        let createdTabID = ScriptTab.stableID(controller: createdController)
+        // With non-native tabs `newTab` returns the parent controller, and the new
+        // tab is whichever one it just selected.
+        let createdTab = createdController.usesNonNativeTabs ? createdController.activeTab : nil
+        let createdTabID = ScriptTab.stableID(controller: createdController, tab: createdTab)
 
         if let targetWindow,
            let scriptTab = targetWindow.valueInTabs(uniqueID: createdTabID) {
@@ -289,7 +292,7 @@ extension NSApplication {
         // Fall back to wrapping the created controller if AppKit tab-group
         // bookkeeping has not fully refreshed in the current run loop.
         let fallbackWindow = ScriptWindow(primaryController: createdController)
-        return ScriptTab(window: fallbackWindow, controller: createdController)
+        return ScriptTab(window: fallbackWindow, controller: createdController, tab: createdTab)
     }
 }
 

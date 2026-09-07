@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 
 /// A terminal window style that provides a transparent titlebar effect. With this effect, the titlebar
 /// matches the background color of the window.
@@ -12,6 +13,9 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
     private weak var observedTabGroup: NSWindowTabGroup?
     private var tabGroupWindowsObservation: NSKeyValueObservation?
     private var tabBarVisibleObservation: NSKeyValueObservation?
+
+    /// Watches our own tab list when we draw the tabs ourselves. See `setupKVO`.
+    private var customTabsCancellable: AnyCancellable?
 
     deinit {
         tabGroupWindowsObservation?.invalidate()
@@ -135,6 +139,24 @@ class TransparentTitlebarTerminalWindow: TerminalWindow {
         // by AppKit, so always rebind on the next main-queue turn.
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+
+            // With non-native tabs there is no tab group to observe. The equivalent
+            // trigger is our own tab list changing, which resizes the titlebar
+            // accessory and can make AppKit rebuild the titlebar views.
+            if let terminalController = self.terminalController,
+               terminalController.usesNonNativeTabs {
+                guard self.customTabsCancellable == nil else { return }
+                self.customTabsCancellable = terminalController.$tabs
+                    .map(\.count)
+                    .removeDuplicates()
+                    .dropFirst()
+                    .receive(on: DispatchQueue.main)
+                    .sink { [weak self] _ in
+                        guard let self, let lastSurfaceConfig = self.lastSurfaceConfig else { return }
+                        self.syncAppearance(lastSurfaceConfig)
+                    }
+                return
+            }
 
             // Recheck because the tab group and observation state may have changed
             // while this work was waiting on the main queue.

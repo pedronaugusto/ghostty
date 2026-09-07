@@ -37,20 +37,79 @@ class BaseTerminalController: NSWindowController,
     private static let surfaceControllers =
         NSMapTable<Ghostty.SurfaceView, BaseTerminalController>.weakToWeakObjects()
 
+    /// The same, for tabs. A tab moves between windows by drag, and both undo
+    /// and the drop target need to find where it is now.
+    private static let tabControllers =
+        NSMapTable<TerminalTab, BaseTerminalController>.weakToWeakObjects()
+
     /// The app instance that this terminal view will represent.
     let ghostty: Ghostty.App
 
-    /// The currently focused surface.
+    /// The currently focused surface. This is always a surface in the active tab.
     var focusedSurface: Ghostty.SurfaceView? {
-        didSet { syncFocusToSurfaceTree() }
+        didSet {
+            activeTab?.focusedSurface = focusedSurface
+            activeTab?.observeTitle()
+            syncFocusToSurfaceTree()
+        }
     }
 
-    /// The tree of splits within this terminal window.
+    /// The tree of splits within the ACTIVE tab of this terminal window.
+    ///
+    /// Almost everything in the app means "the active tab" when it says
+    /// "surface tree", which is why this keeps its name and its position on the
+    /// controller. `allSurfaces` is the accessor for every surface in the
+    /// window regardless of tab.
     @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
         didSet {
-            Self.updateSurfaceControllers(self, from: oldValue, to: surfaceTree)
+            // Write straight back into the active tab, so `activeTab.surfaceTree`
+            // and this are the same tree for as long as there is an active tab.
+            // Everything that walks all tabs -- `allSurfaces`, occlusion, quit
+            // confirmation, restoration -- relies on that.
+            activeTab?.surfaceTree = surfaceTree
+            updateSurfaceControllers(from: oldValue, to: surfaceTree)
             surfaceTreeDidChange(from: oldValue, to: surfaceTree)
         }
+    }
+
+    /// The tabs owned by this controller.
+    ///
+    /// This is non-empty for the entire lifetime of the controller after init.
+    /// With native tabs it always has exactly one element,
+    /// because in that mode a tab is a whole separate window with its own
+    /// controller.
+    @Published private(set) var tabs: [TerminalTab] = []
+
+    /// The index into `tabs` of the tab whose content is currently displayed.
+    @Published private(set) var activeTabIndex: Int = 0
+
+    /// The tab whose content is currently displayed.
+    var activeTab: TerminalTab? {
+        tabs[safe: activeTabIndex]
+    }
+
+    /// Every surface in this window, across every tab.
+    ///
+    /// Use this (not `surfaceTree`) for anything that is a property of the
+    /// window rather than of the visible session: quit confirmation, occlusion,
+    /// teardown.
+    var allSurfaces: [Ghostty.SurfaceView] {
+        tabs.flatMap(\.surfaces)
+    }
+
+    /// Whether this controller draws its own tab bar rather than using macOS
+    /// native window tabbing. Overridden by subclasses that support it.
+    var usesNonNativeTabs: Bool { false }
+
+    /// The number of tabs alongside this one, however tabs are implemented.
+    ///
+    /// With native tabbing that is the size of the window's tab group; with
+    /// non-native tabs it is our own tab list. Callers deciding whether a tab
+    /// action is possible must use this rather than reading `tabGroup`, which
+    /// is empty by design when we own the tabs.
+    var tabCount: Int {
+        if usesNonNativeTabs { return tabs.count }
+        return window?.tabGroup?.windows.count ?? (window == nil ? 0 : 1)
     }
 
     /// This can be set to show/hide the command palette.
@@ -100,10 +159,17 @@ class BaseTerminalController: NSWindowController,
     /// Cancellable for clipboard confirmation requests from surfaces in this controller.
     private var clipboardConfirmationCancellable: AnyCancellable?
 
+    /// Signals that the set of surfaces in this window may have changed. Sent
+    /// after the change is committed, unlike `@Published`. See `allSurfacesPublisher`.
+    let surfacesDidChangeSubject = CurrentValueSubject<Void, Never>(())
+
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
-        didSet { applyTitleToWindow() }
+        didSet {
+            activeTab?.titleOverride = titleOverride
+            applyTitleToWindow()
+        }
     }
 
     /// The last computed title from the focused surface (without the override).
@@ -150,8 +216,12 @@ class BaseTerminalController: NSWindowController,
 
         // Initialize our initial surface.
         guard let ghostty_app = ghostty.app else { preconditionFailure("app must be loaded") }
-        self.surfaceTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: base))
-        Self.updateSurfaceControllers(self, from: .init(), to: surfaceTree)
+        let initialTree = tree ?? .init(view: Ghostty.SurfaceView(ghostty_app, baseConfig: base))
+        self.tabs = [TerminalTab(surfaceTree: initialTree)]
+        self.activeTabIndex = 0
+        self.surfaceTree = initialTree
+        updateSurfaceControllers(from: .init(), to: surfaceTree)
+        tabs.forEach { Self.tabControllers.setObject(self, forKey: $0) }
 
         // Setup our bell state for the window
         setupBellNotificationPublisher()
@@ -218,6 +288,11 @@ class BaseTerminalController: NSWindowController,
             object: nil)
         center.addObserver(
             self,
+            selector: #selector(ghosttyTabDragEndedNoTarget(_:)),
+            name: .ghosttyTabDragEndedNoTarget,
+            object: nil)
+        center.addObserver(
+            self,
             selector: #selector(ghosttySurfaceDragEndedNoTarget(_:)),
             name: .ghosttySurfaceDragEndedNoTarget,
             object: nil)
@@ -247,33 +322,51 @@ class BaseTerminalController: NSWindowController,
     /// view relationship.
     static func controller(owning surface: Ghostty.SurfaceView) -> BaseTerminalController? {
         if let controller = surfaceControllers.object(forKey: surface),
-           controller.surfaceTree.contains(surface) {
+           controller.owns(surface) {
             return controller
         }
 
         if let controller = surface.window?.windowController as? BaseTerminalController,
-           controller.surfaceTree.contains(surface) {
+           controller.owns(surface) {
             return controller
         }
 
         return NSApp.windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .first { $0.surfaceTree.contains(surface) }
+            .first { $0.owns(surface) }
     }
 
-    private static func updateSurfaceControllers(
-        _ controller: BaseTerminalController,
+    /// Whether this controller owns the given surface in any of its tabs.
+    func owns(_ surface: Ghostty.SurfaceView) -> Bool {
+        tabs.contains { $0.surfaceTree.contains(surface) }
+    }
+
+    /// Finds the controller currently holding the given tab.
+    static func controller(owning tab: TerminalTab) -> BaseTerminalController? {
+        if let controller = tabControllers.object(forKey: tab),
+           controller.tabs.contains(where: { $0 === tab }) {
+            return controller
+        }
+
+        return NSApp.windows
+            .compactMap { $0.windowController as? BaseTerminalController }
+            .first { $0.tabs.contains { $0 === tab } }
+    }
+
+    private func updateSurfaceControllers(
         from oldTree: SplitTree<Ghostty.SurfaceView>,
         to newTree: SplitTree<Ghostty.SurfaceView>
     ) {
+        // A surface leaving the active tab's tree hasn't necessarily left this
+        // window, so only deregister surfaces no longer in ANY of our tabs.
         for surface in oldTree where !newTree.contains(surface) {
-            if surfaceControllers.object(forKey: surface) === controller {
-                surfaceControllers.removeObject(forKey: surface)
+            if Self.surfaceControllers.object(forKey: surface) === self, !owns(surface) {
+                Self.surfaceControllers.removeObject(forKey: surface)
             }
         }
 
         for surface in newTree {
-            surfaceControllers.setObject(controller, forKey: surface)
+            Self.surfaceControllers.setObject(self, forKey: surface)
         }
     }
 
@@ -343,13 +436,14 @@ class BaseTerminalController: NSWindowController,
             focusedSurface = nil
         }
         syncSurfaceTreeOcclusionState()
+        surfacesDidChangeSubject.send()
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
     /// what surface is focused. This must be called whenever a surface OR window changes focus.
     func syncFocusToSurfaceTree() {
         var newlyFocused: Ghostty.SurfaceView?
-        for surfaceView in surfaceTree {
+        for surfaceView in allSurfaces {
             // Our focus state requires that this window is key and our currently
             // focused surface is the surface in this view.
             let focused: Bool = (window?.isKeyWindow ?? false) &&
@@ -537,15 +631,39 @@ class BaseTerminalController: NSWindowController,
         )
     }
 
+    /// Give a tab a new split tree, going through `surfaceTree` while it is the
+    /// active tab so the controller and what is on screen stay in step.
+    ///
+    /// The tab may have moved to another window since a caller captured it, so
+    /// this always writes through whichever controller holds it now.
+    static func setSurfaceTree(_ tree: SplitTree<Ghostty.SurfaceView>, for tab: TerminalTab) {
+        guard let controller = controller(owning: tab) else {
+            tab.surfaceTree = tree
+            return
+        }
+
+        if tab === controller.activeTab {
+            controller.surfaceTree = tree
+        } else {
+            tab.surfaceTree = tree
+        }
+    }
+
     func replaceSurfaceTree(
         _ newTree: SplitTree<Ghostty.SurfaceView>,
+        in tab: TerminalTab? = nil,
         moveFocusTo newView: Ghostty.SurfaceView? = nil,
         moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
         undoAction: String? = nil
     ) {
+        // Undo has to put the tree back where it came from. Without this the
+        // closure writes into whatever tab is active when it runs, freeing that
+        // tab's surfaces and killing the processes in them.
+        guard let tab = tab ?? activeTab else { return }
+
         // Setup our new split tree
-        let oldTree = surfaceTree
-        surfaceTree = newTree
+        let oldTree = tab.surfaceTree
+        Self.setSurfaceTree(newTree, for: tab)
         if let newView {
             DispatchQueue.main.async {
                 Ghostty.moveFocus(to: newView, from: oldView)
@@ -561,8 +679,9 @@ class BaseTerminalController: NSWindowController,
         undoManager.registerUndo(
             withTarget: self,
             expiresAfter: undoExpiration
-        ) { target in
-            target.surfaceTree = oldTree
+        ) { [weak tab] target in
+            guard let tab else { return }
+            Self.setSurfaceTree(oldTree, for: tab)
             if let oldView {
                 DispatchQueue.main.async {
                     Ghostty.moveFocus(to: oldView, from: target.focusedSurface)
@@ -572,9 +691,11 @@ class BaseTerminalController: NSWindowController,
             undoManager.registerUndo(
                 withTarget: target,
                 expiresAfter: target.undoExpiration
-            ) { target in
+            ) { [weak tab] target in
+                guard let tab else { return }
                 target.replaceSurfaceTree(
                     newTree,
+                    in: tab,
                     moveFocusTo: newView,
                     moveFocusFrom: target.focusedSurface,
                     undoAction: undoAction)
@@ -804,6 +925,17 @@ class BaseTerminalController: NSWindowController,
 
         // Show a brief highlight to help the user locate the presented terminal.
         target.highlight()
+    }
+
+    /// A tab dragged out of every window becomes a window of its own, which is
+    /// what dragging a native tab out of the bar does.
+    @objc private func ghosttyTabDragEndedNoTarget(_ notification: Notification) {
+        guard let tab = notification.object as? TerminalTab else { return }
+        guard Self.controller(owning: tab) === self, tabs.count > 1 else { return }
+
+        (self as? TerminalController)?.moveTabToNewWindow(
+            tab,
+            position: notification.userInfo?[Notification.Name.ghosttyTabDragEndedNoTargetPointKey] as? NSPoint)
     }
 
     @objc private func ghosttySurfaceDragEndedNoTarget(_ notification: Notification) {
@@ -1199,13 +1331,14 @@ class BaseTerminalController: NSWindowController,
         guard window != nil else { return true }
 
         // If we have no surfaces, close.
-        if surfaceTree.isEmpty { return true }
+        let surfaces = allSurfaces
+        if surfaces.isEmpty { return true }
 
         // If we already have an alert, continue with it
         guard alert == nil else { return false }
 
         // If our surfaces don't require confirmation, close.
-        if !surfaceTree.contains(where: { $0.needsConfirmQuit }) { return true }
+        if !surfaces.contains(where: { $0.needsConfirmQuit }) { return true }
 
         return false
     }
@@ -1231,7 +1364,7 @@ class BaseTerminalController: NSWindowController,
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
 
-        for surfaceView in surfaceTree {
+        for surfaceView in allSurfaces {
             cancelPendingClipboardConfirmation(for: surfaceView)
         }
 
@@ -1283,11 +1416,16 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func syncSurfaceTreeOcclusionState() {
-        let visible = self.window?.occlusionState.contains(.visible) ?? false
-        for view in surfaceTree {
-            if let surface = view.surface, view.isWindowVisible != visible {
-                ghostty_surface_set_occlusion(surface, visible)
-                view.isWindowVisible = visible
+        let windowVisible = self.window?.occlusionState.contains(.visible) ?? false
+        for (index, tab) in tabs.enumerated() {
+            // Surfaces in a background tab are not on screen at all, no matter
+            // what the window's occlusion state says.
+            let visible = windowVisible && index == activeTabIndex
+            for view in tab.surfaceTree {
+                if let surface = view.surface, view.isWindowVisible != visible {
+                    ghostty_surface_set_occlusion(surface, visible)
+                    view.isWindowVisible = visible
+                }
             }
         }
     }
@@ -1539,15 +1677,292 @@ extension BaseTerminalController: NSMenuItemValidation {
     }
 }
 
+// MARK: Tabs
+
+extension BaseTerminalController {
+    /// Where a newly created tab belongs, per `window-new-tab-position`.
+    ///
+    /// This mirrors what the native path does with `addTabbedWindowSafely`:
+    /// `end` appends to the window, anything else opens beside the tab the new
+    /// one was created from.
+    var newTabIndex: Int {
+        switch ghostty.config.windowNewTabPosition {
+        case "end": return tabs.count
+        default: return activeTabIndex + 1
+        }
+    }
+
+    /// Create a new tab holding a fresh surface, and select it.
+    ///
+    /// `index` is where to insert; nil appends.
+    @discardableResult
+    func addTab(
+        baseConfig: Ghostty.SurfaceConfiguration? = nil,
+        at index: Int? = nil
+    ) -> TerminalTab? {
+        guard let app = ghostty.app else { return nil }
+        return addTab(
+            surfaceTree: .init(view: Ghostty.SurfaceView(app, baseConfig: baseConfig)),
+            at: index)
+    }
+
+    /// Add an existing split tree as a new tab, and select it.
+    @discardableResult
+    func addTab(
+        surfaceTree tree: SplitTree<Ghostty.SurfaceView>,
+        at index: Int? = nil
+    ) -> TerminalTab? {
+        guard !tree.isEmpty else { return nil }
+
+        let tab = TerminalTab(surfaceTree: tree)
+        let insertAt = min(max(index ?? tabs.count, 0), tabs.count)
+        tabs.insert(tab, at: insertAt)
+
+        // Keep the active index pointing at the same tab it did before.
+        if insertAt <= activeTabIndex { activeTabIndex += 1 }
+
+        // Register ownership immediately: notifications from these surfaces can
+        // arrive before the tab is ever selected.
+        Self.tabControllers.setObject(self, forKey: tab)
+        for surface in tree {
+            Self.surfaceControllers.setObject(self, forKey: surface)
+        }
+
+        surfacesDidChangeSubject.send()
+        selectTab(at: insertAt)
+        return tab
+    }
+
+    /// Select the tab at the given index.
+    func selectTab(at index: Int) {
+        guard tabs.indices.contains(index), index != activeTabIndex else { return }
+
+        // The outgoing tab needs no stashing: `surfaceTree` and `focusedSurface`
+        // both write straight through to it as they change.
+        activeTabIndex = index
+        let incoming = tabs[index]
+
+        // Attach the tree BEFORE asserting focus. `Ghostty.moveFocus` polls for
+        // the target's `window` and silently gives up after 0.5s, so focusing a
+        // surface that isn't in the hierarchy yet does nothing.
+        surfaceTree = incoming.surfaceTree
+
+        let target = incoming.focusedSurface ?? incoming.surfaces.first
+        focusedSurface = target
+        if let target {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.activeTab === incoming else { return }
+                Ghostty.moveFocus(to: target)
+            }
+        }
+
+        activeTabDidChange()
+    }
+
+    /// Select a specific tab.
+    func selectTab(_ tab: TerminalTab) {
+        guard let index = tabs.firstIndex(where: { $0 === tab }) else { return }
+        selectTab(at: index)
+    }
+
+    /// Select the next or previous tab, wrapping around.
+    func selectTab(offset: Int) {
+        guard tabs.count > 1, offset != 0 else { return }
+        let count = tabs.count
+        let next = ((activeTabIndex + offset) % count + count) % count
+        selectTab(at: next)
+    }
+
+    /// Remove the tab at the given index.
+    ///
+    /// Returns false when this was the last tab, in which case nothing is
+    /// removed and the caller should close the window instead.
+    @discardableResult
+    func removeTab(at index: Int) -> Bool {
+        guard tabs.indices.contains(index), tabs.count > 1 else { return false }
+
+        let removed = tabs[index]
+        let wasActive = index == activeTabIndex
+
+        // Deregister before dropping so a surface that somehow outlives the tab
+        // doesn't keep resolving to this controller.
+        if Self.tabControllers.object(forKey: removed) === self {
+            Self.tabControllers.removeObject(forKey: removed)
+        }
+        for surface in removed.surfaces {
+            cancelPendingClipboardConfirmation(for: surface)
+            if Self.surfaceControllers.object(forKey: surface) === self {
+                Self.surfaceControllers.removeObject(forKey: surface)
+            }
+        }
+
+        tabs.remove(at: index)
+
+        if wasActive {
+            // Fall to the tab that took this one's place, else the new last.
+            let target = min(index, tabs.count - 1)
+            // Force a reselect: activeTabIndex may already equal `target`.
+            activeTabIndex = -1
+            selectTab(at: target)
+        } else if index < activeTabIndex {
+            activeTabIndex -= 1
+        }
+
+        surfacesDidChangeSubject.send()
+        return true
+    }
+
+    /// Move the active tab by the given signed amount, clamped to the ends.
+    func moveActiveTab(amount: Int) {
+        guard tabs.count > 1, amount != 0 else { return }
+        let from = activeTabIndex
+        moveTab(from: from, to: min(max(from + amount, 0), tabs.count - 1))
+    }
+
+    /// Move any tab to a new position, keeping the selection on whichever tab
+    /// held it. This is what a drag in the tab bar does.
+    func moveTab(from: Int, to: Int) {
+        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+
+        let moved = Self.activeIndex(movingFrom: from, to: to, active: activeTabIndex)
+        let tab = tabs.remove(at: from)
+        tabs.insert(tab, at: to)
+        activeTabIndex = moved
+
+        activeTabDidChange()
+        invalidateRestorableState()
+    }
+
+    /// Where the selection lands when the tab at `from` moves to `to`.
+    ///
+    /// The selected tab keeps the selection wherever it ends up; every other
+    /// tab shifts by one only if the move crossed it.
+    static func activeIndex(movingFrom from: Int, to: Int, active: Int) -> Int {
+        if active == from { return to }
+        if from < active && to >= active { return active - 1 }
+        if from > active && to <= active { return active + 1 }
+        return active
+    }
+
+    /// Insert an existing tab, taking it from whichever controller holds it.
+    ///
+    /// Within one window this is a reorder. Across windows the tab moves, and
+    /// the window it came from closes if it was the last one there. The tab
+    /// object itself moves, so its title override, color and focus come with
+    /// it.
+    func accept(_ tab: TerminalTab, at index: Int) {
+        guard let source = Self.controller(owning: tab) else { return }
+
+        if source === self {
+            guard let from = tabs.firstIndex(where: { $0 === tab }) else { return }
+            moveTab(from: from, to: min(max(index, 0), tabs.count - 1))
+            return
+        }
+
+        source.detach(tab)
+        insert(tab, at: index)
+    }
+
+    /// Remove a tab without tearing down its surfaces, for a move elsewhere.
+    ///
+    /// Emptying the tree is what closes the window, via `surfaceTreeDidChange`,
+    /// which is the same way a window goes away when its last split is dragged
+    /// out.
+    func detach(_ tab: TerminalTab) {
+        guard let index = tabs.firstIndex(where: { $0 === tab }) else { return }
+
+        if Self.tabControllers.object(forKey: tab) === self {
+            Self.tabControllers.removeObject(forKey: tab)
+        }
+        for surface in tab.surfaces {
+            cancelPendingClipboardConfirmation(for: surface)
+            if Self.surfaceControllers.object(forKey: surface) === self {
+                Self.surfaceControllers.removeObject(forKey: surface)
+            }
+        }
+
+        if tabs.count > 1 {
+            tabs.remove(at: index)
+            if index == activeTabIndex {
+                let target = min(index, tabs.count - 1)
+                activeTabIndex = -1
+                selectTab(at: target)
+            } else if index < activeTabIndex {
+                activeTabIndex -= 1
+            }
+        } else {
+            tabs = []
+            activeTabIndex = 0
+            focusedSurface = nil
+
+            // Emptying the tree closes this window, via `surfaceTreeDidChange`.
+            // Deferred because a detach can happen inside a drag session owned
+            // by a view in that window, which must not be torn down mid-event.
+            DispatchQueue.main.async { [weak self] in
+                self?.surfaceTree = .init()
+            }
+        }
+
+        surfacesDidChangeSubject.send()
+    }
+
+    /// Adopt a tab detached from somewhere else.
+    func insert(_ tab: TerminalTab, at index: Int) {
+        let insertAt = min(max(index, 0), tabs.count)
+        tabs.insert(tab, at: insertAt)
+
+        Self.tabControllers.setObject(self, forKey: tab)
+        for surface in tab.surfaces {
+            Self.surfaceControllers.setObject(self, forKey: surface)
+        }
+
+        surfacesDidChangeSubject.send()
+
+        // An adopted tab is the one the user is moving, so it becomes active.
+        // Force a reselect: `activeTabIndex` may already equal `insertAt`.
+        activeTabIndex = -1
+        selectTab(at: insertAt)
+    }
+
+    /// Set a tab's color, keeping the titlebar indicator in step when it is the
+    /// tab that indicator is showing.
+    func setTabColor(_ color: TerminalTabColor, for tab: TerminalTab) {
+        guard tab.tabColor != color else { return }
+        tab.tabColor = color
+        if tab === activeTab {
+            (window as? TerminalWindow)?.tabColorDidChange()
+        }
+        invalidateRestorableState()
+    }
+
+    /// Called after the active tab changes. Subclasses should call super.
+    func activeTabDidChange() {
+        // Adopt the incoming tab's title and override so the window chrome
+        // matches the session that's now on screen.
+        if let tab = activeTab {
+            lastComputedTitle = tab.computedTitle
+            // Writing this back into the tab it came from is a no-op.
+            titleOverride = tab.titleOverride
+        }
+        applyTitleToWindow()
+
+        // The titlebar color indicator follows whichever tab owns the color now.
+        (window as? TerminalWindow)?.tabColorDidChange()
+
+        // Which tab is selected is part of the restored state.
+        invalidateRestorableState()
+    }
+}
+
 // MARK: Clipboard Confirmation
 
 extension BaseTerminalController {
     /// Presents clipboard confirmations published by surfaces in this controller.
     private func setupClipboardConfirmationPublisher() {
-        clipboardConfirmationCancellable = $surfaceTree
-            // Rebuild the merged publisher whenever the split tree changes.
-            .map { tree in
-                Publishers.MergeMany(tree.map { surface in
+        clipboardConfirmationCancellable = allSurfacesPublisher
+            // Rebuild the merged publisher whenever the surfaces change.
+            .map { surfaces in
+                Publishers.MergeMany(surfaces.map { surface in
                     // Carry the stable value-type ID rather than capturing the
                     // surface in the operator chain. The subscription therefore
                     // cannot extend the SurfaceView's lifetime.
@@ -1569,7 +1984,7 @@ extension BaseTerminalController {
             // avoid controller -> cancellable -> sink -> controller.
             .sink { [weak self] id, request in
                 guard let self,
-                      let surface = surfaceTree.first(where: { $0.id == id }) else { return }
+                      let surface = allSurfaces.first(where: { $0.id == id }) else { return }
                 onConfirmClipboardRequest(request, for: surface)
             }
     }
@@ -1693,11 +2108,20 @@ extension BaseTerminalController {
     /// bell state changes.
     private func setupBellNotificationPublisher() {
         bellStateCancellable = surfaceValuesPublisher(valueKeyPath: \.bell, publisherKeyPath: \.$bell)
-            .map { $0.values.contains(true) }
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] hasBell in
+            .sink { [weak self] bells in
                 guard let self else { return }
+
+                // Per-tab state first, so the tab bar can mark which tab rang
+                // rather than only whether the window did.
+                for tab in tabs {
+                    let tabBell = tab.surfaces.contains { bells[$0.id] ?? false }
+                    if tab.bell != tabBell { tab.bell = tabBell }
+                }
+
+                let hasBell = bells.values.contains(true)
+                guard bell != hasBell else { return }
                 bell = hasBell
                 NotificationCenter.default.post(
                     name: .terminalWindowBellDidChangeNotification,
@@ -1715,19 +2139,32 @@ extension BaseTerminalController {
         valueKeyPath: KeyPath<Ghostty.SurfaceView, Value>,
         publisherKeyPath: KeyPath<Ghostty.SurfaceView, Published<Value>.Publisher>
     ) -> AnyPublisher<[Ghostty.SurfaceView.ID: Value], Never> {
-        // `surfaceTree` can be replaced entirely when splits are added/removed/closed.
-        // For each tree snapshot we build a fresh publisher that watches all surfaces
-        // in that snapshot.
-        $surfaceTree
-            .map { tree in
-                tree.valuesPublisher(
+        // The surface set can be replaced entirely when splits or tabs are
+        // added/removed/closed. For each snapshot we build a fresh publisher
+        // that watches all surfaces in that snapshot.
+        allSurfacesPublisher
+            .map { surfaces in
+                surfaces.valuesPublisher(
                     valueKeyPath: valueKeyPath,
                     publisherKeyPath: publisherKeyPath
                 )
             }
-            // Keep only the latest tree publisher active. This automatically cancels
-            // subscriptions for old/removed surfaces when the tree changes.
+            // Keep only the latest snapshot's publisher active. This automatically
+            // cancels subscriptions for surfaces that are gone.
             .switchToLatest()
+            .eraseToAnyPublisher()
+    }
+
+    /// Emits every surface in this window, across every tab, whenever that set
+    /// can have changed.
+    ///
+    /// This is driven by an explicit subject rather than `$surfaceTree` because
+    /// `@Published` emits from `willSet`, so a subscriber reading back through
+    /// the controller would see the tree that is being replaced. `surfacesDidChange`
+    /// is sent from `didSet` instead, once the new state is committed.
+    var allSurfacesPublisher: AnyPublisher<[Ghostty.SurfaceView], Never> {
+        surfacesDidChangeSubject
+            .compactMap { [weak self] in self?.allSurfaces }
             .eraseToAnyPublisher()
     }
 }

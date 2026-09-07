@@ -1261,7 +1261,8 @@ extension Ghostty {
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
                     // See gotoTab for notes on this check.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView),
+                          controller.tabCount > 1 else { return false }
 
                     NotificationCenter.default.post(
                         name: .ghosttyMoveTab,
@@ -1293,7 +1294,12 @@ extension Ghostty {
 
                     // Similar to goto_split (see comment there) about our performability,
                     // we should make this more accurate later.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    //
+                    // Ask the owning controller rather than reading the window's
+                    // tab group: with `macos-non-native-tabs` there is no tab
+                    // group even when the window has many tabs.
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView),
+                          controller.tabCount > 1 else { return false }
 
                     NotificationCenter.default.post(
                         name: Notification.ghosttyGotoTab,

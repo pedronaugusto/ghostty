@@ -58,14 +58,40 @@ class TerminalWindow: NSWindow {
         windowController as? TerminalController
     }
 
+    /// Backing storage for ``tabColor`` when the window is the tab, i.e. with
+    /// native tabs. With non-native tabs the active ``TerminalTab`` owns it instead.
+    private var windowTabColor: TerminalTabColor = .none
+
     /// The color assigned to this window's tab. Setting this updates the tab color indicator
     /// and marks the window's restorable state as dirty.
-    var tabColor: TerminalTabColor = .none {
-        didSet {
-            guard tabColor != oldValue else { return }
-            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+    ///
+    /// With non-native tabs one window holds many tabs, so the color belongs to the
+    /// tab rather than the window. This forwards to the active tab in that case
+    /// so every existing caller -- restoration, undo, the command palette and
+    /// the tab context menu -- keeps working unchanged.
+    var tabColor: TerminalTabColor {
+        get { customTabsActiveTab?.tabColor ?? windowTabColor }
+        set {
+            guard tabColor != newValue else { return }
+            if let tab = customTabsActiveTab {
+                tab.tabColor = newValue
+            } else {
+                windowTabColor = newValue
+            }
+            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: newValue)
             invalidateRestorableState()
         }
+    }
+
+    /// The tab that owns this window's color, or nil when the window itself does.
+    private var customTabsActiveTab: TerminalTab? {
+        guard let terminalController, terminalController.usesNonNativeTabs else { return nil }
+        return terminalController.activeTab
+    }
+
+    /// Refresh the color indicator after the active tab changes.
+    func tabColorDidChange() {
+        tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
     }
 
     // MARK: NSWindow Overrides
@@ -92,13 +118,21 @@ class TerminalWindow: NSWindow {
         ) { [weak self] n in
             guard let self, let menu = n.object as? NSMenu else { return }
             self.configureTabContextMenuIfNeeded(menu)
+            self.configureWindowMenuIfNeeded(menu)
         }
 
         // This is required so that window restoration properly creates our tabs
         // again. I'm not sure why this is required. If you don't do this, then
         // tabs restore as separate windows.
         tabbingMode = .preferred
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            // Our controller sets `.disallowed` in `windowDidLoad`, which runs
+            // before this tick. Restoring `.automatic` here would hand tabbing
+            // back to AppKit and undo non-native tabs entirely.
+            if self.terminalController?.usesNonNativeTabs ?? false { return }
+
             self.tabbingMode = .automatic
         }
 
@@ -242,6 +276,12 @@ class TerminalWindow: NSWindow {
     }
 
     override func mergeAllWindows(_ sender: Any?) {
+        // AppKit merges tab groups, which don't exist with non-native tabs.
+        if let terminalController, terminalController.usesNonNativeTabs {
+            terminalController.mergeAllWindows()
+            return
+        }
+
         super.mergeAllWindows(sender)
 
         // It takes an event loop cycle to merge all the windows so we set a
@@ -278,9 +318,15 @@ class TerminalWindow: NSWindow {
     static let tabBarIdentifier: NSUserInterfaceItemIdentifier = .init("_ghosttyTabBar")
 
     var hasMoreThanOneTabs: Bool {
+        // When we draw our own tabs there is no tab group at all, so the
+        // count has to come from the controller.
+        if let terminalController, terminalController.usesNonNativeTabs {
+            return terminalController.tabs.count > 1
+        }
+
         /// accessing ``tabGroup?.windows`` here
         /// will cause other edge cases, be careful
-        (tabbedWindows?.count ?? 0) > 1
+        return (tabbedWindows?.count ?? 0) > 1
     }
 
     func isTabBar(_ childViewController: NSTitlebarAccessoryViewController) -> Bool {
@@ -707,6 +753,72 @@ extension TerminalWindow {
     private static let tabColorSeparatorIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorSeparator")
 
     private static let tabColorPaletteIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorPalette")
+
+    private static let moveTabToNewWindowMenuItemIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.moveTabToNewWindowMenuItem")
+    private static let mergeAllWindowsMenuItemIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.mergeAllWindowsMenuItem")
+
+    /// Adds "Move Tab to New Window" and "Merge All Windows" to the Window menu
+    /// when Ghostty owns the tabs.
+    ///
+    /// AppKit injects both itself, but only while window tabbing is available.
+    /// With non-native tabs `tabbingMode` is `.disallowed`, so they never appear and
+    /// the commands would be unreachable from the menu bar. Building them as the
+    /// menu opens, rather than shipping them in the nib, is what keeps them from
+    /// duplicating AppKit's in the styles where AppKit still supplies them.
+    func configureWindowMenuIfNeeded(_ menu: NSMenu) {
+        guard isWindowMenu(menu) else { return }
+        let controller = terminalController
+        Self.configureWindowMenu(
+            menu,
+            target: (controller?.usesNonNativeTabs ?? false) ? controller : nil)
+    }
+
+    /// Rebuilds the two items in `menu`, adding them for `target` or removing
+    /// them when it is nil.
+    ///
+    /// Separate from the notification plumbing above so the placement and the
+    /// deduplication can be tested without a window.
+    static func configureWindowMenu(_ menu: NSMenu, target: AnyObject?) {
+        menu.removeItems(withIdentifiers: [
+            Self.moveTabToNewWindowMenuItemIdentifier,
+            Self.mergeAllWindowsMenuItemIdentifier,
+        ])
+
+        guard let terminalController = target else { return }
+
+        // Sit with the other window-level commands, above the separator that
+        // precedes the split commands. AppKit keeps the window list at the very
+        // bottom, so appending would land under it.
+        let moveOut = NSMenuItem(
+            title: "Move Tab to New Window",
+            action: #selector(TerminalController.moveGhosttyTabToNewWindow(_:)),
+            keyEquivalent: "")
+        moveOut.identifier = Self.moveTabToNewWindowMenuItemIdentifier
+        moveOut.target = terminalController
+        moveOut.setImageIfDesired(systemSymbolName: "macwindow.badge.plus")
+        guard menu.insertItem(
+            moveOut,
+            after: NSSelectorFromString("toggleVisibility:")) != nil
+        else { return }
+
+        let merge = NSMenuItem(
+            title: "Merge All Windows",
+            action: #selector(TerminalController.mergeAllGhosttyWindows(_:)),
+            keyEquivalent: "")
+        merge.identifier = Self.mergeAllWindowsMenuItemIdentifier
+        merge.target = terminalController
+        merge.setImageIfDesired(systemSymbolName: "square.stack")
+        menu.insertItem(
+            merge,
+            after: #selector(TerminalController.moveGhosttyTabToNewWindow(_:)))
+    }
+
+    /// True for the application's Window menu, and only for the window whose
+    /// commands it would be showing. Every window sees the notification, so
+    /// without the key check the oldest one wins.
+    private func isWindowMenu(_ menu: NSMenu) -> Bool {
+        NSApp.keyWindow === self && menu === NSApp.windowsMenu
+    }
 
     func configureTabContextMenuIfNeeded(_ menu: NSMenu) {
         guard isTabContextMenu(menu) else { return }

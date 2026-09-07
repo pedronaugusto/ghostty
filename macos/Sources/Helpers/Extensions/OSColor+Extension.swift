@@ -9,6 +9,12 @@ extension NSColor {
         return self.luminance > 0.5
     }
 
+    /// Dark enough that leaving titlebar chrome unpainted is indistinguishable
+    /// from painting it, so the chrome has to be filled instead.
+    var isVeryDarkColor: Bool {
+        return self.luminance < 0.05
+    }
+
     var luminance: Double {
         var r: CGFloat = 0
         var g: CGFloat = 0

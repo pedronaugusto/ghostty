@@ -165,7 +165,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     // MARK: Tab Bar Styling
 
     var hasVeryDarkBackground: Bool {
-        backgroundColor.luminance < 0.05
+        backgroundColor.isVeryDarkColor
     }
 
     private var newTabButtonImageLayer: VibrantLayer?

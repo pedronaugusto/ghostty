@@ -60,7 +60,7 @@ final class ScriptWindow: NSObject {
     @objc(tabs)
     var tabs: [ScriptTab] {
         guard NSApp.isAppleScriptEnabled else { return [] }
-        return controllers.map { ScriptTab(window: self, controller: $0) }
+        return tabRefs.map { ScriptTab(window: self, controller: $0.controller, tab: $0.tab) }
     }
 
     /// Exposed as the AppleScript `selected tab` property.
@@ -70,7 +70,10 @@ final class ScriptWindow: NSObject {
     var selectedTab: ScriptTab? {
         guard NSApp.isAppleScriptEnabled else { return nil }
         guard let selectedController else { return nil }
-        return ScriptTab(window: self, controller: selectedController)
+        return ScriptTab(
+            window: self,
+            controller: selectedController,
+            tab: selectedController.usesNonNativeTabs ? selectedController.activeTab : nil)
     }
 
     /// Enables unique-ID lookup for `tabs` references.
@@ -82,8 +85,10 @@ final class ScriptWindow: NSObject {
     @objc(valueInTabsWithUniqueID:)
     func valueInTabs(uniqueID: String) -> ScriptTab? {
         guard NSApp.isAppleScriptEnabled else { return nil }
-        guard let controller = controller(tabID: uniqueID) else { return nil }
-        return ScriptTab(window: self, controller: controller)
+        guard let ref = tabRefs.first(where: {
+            ScriptTab.stableID(controller: $0.controller, tab: $0.tab) == uniqueID
+        }) else { return nil }
+        return ScriptTab(window: self, controller: ref.controller, tab: ref.tab)
     }
 
     /// Exposed as the AppleScript `terminals` element on a window.
@@ -92,32 +97,57 @@ final class ScriptWindow: NSObject {
     @objc(terminals)
     var terminals: [ScriptTerminal] {
         guard NSApp.isAppleScriptEnabled else { return [] }
-        return controllers
-            .flatMap { $0.surfaceTree.root?.leaves() ?? [] }
-            .map(ScriptTerminal.init)
+        return allSurfaces.map(ScriptTerminal.init)
     }
 
     /// Enables unique-ID lookup for `terminals` references on a window.
     @objc(valueInTerminalsWithUniqueID:)
     func valueInTerminals(uniqueID: String) -> ScriptTerminal? {
         guard NSApp.isAppleScriptEnabled else { return nil }
-        return controllers
-            .flatMap { $0.surfaceTree.root?.leaves() ?? [] }
+        return allSurfaces
             .first(where: { $0.id.uuidString == uniqueID })
             .map(ScriptTerminal.init)
     }
 
-    /// AppleScript tab indexes are 1-based, so we add one to Swift's 0-based
-    /// array index.
-    func tabIndex(for controller: BaseTerminalController) -> Int? {
-        guard NSApp.isAppleScriptEnabled else { return nil }
-        return controllers.firstIndex(where: { $0 === controller }).map { $0 + 1 }
+    /// Every surface in this scripting window, across every tab.
+    private var allSurfaces: [Ghostty.SurfaceView] {
+        controllers.flatMap(\.allSurfaces)
     }
 
-    /// Reports whether a given controller maps to this window's selected tab.
-    func tabIsSelected(_ controller: BaseTerminalController) -> Bool {
+    /// AppleScript tab indexes are 1-based, so we add one to Swift's 0-based
+    /// array index.
+    func tabIndex(for controller: BaseTerminalController, tab: TerminalTab? = nil) -> Int? {
+        guard NSApp.isAppleScriptEnabled else { return nil }
+        return tabRefs.firstIndex(where: {
+            $0.controller === controller && $0.tab === tab
+        }).map { $0 + 1 }
+    }
+
+    /// Reports whether a given controller/tab maps to this window's selected tab.
+    func tabIsSelected(_ controller: BaseTerminalController, tab: TerminalTab? = nil) -> Bool {
         guard NSApp.isAppleScriptEnabled else { return false }
-        return selectedController === controller
+        guard selectedController === controller else { return false }
+        guard let tab else { return true }
+        return controller.activeTab === tab
+    }
+
+    /// One entry per AppleScript-visible tab.
+    ///
+    /// With native tabbing a controller is a tab, so this is one entry per
+    /// controller. With `macos-non-native-tabs` a controller owns many tabs,
+    /// so it expands into one entry each.
+    private struct TabRef {
+        let controller: BaseTerminalController
+        let tab: TerminalTab?
+    }
+
+    private var tabRefs: [TabRef] {
+        controllers.flatMap { controller -> [TabRef] in
+            guard controller.usesNonNativeTabs else {
+                return [TabRef(controller: controller, tab: nil)]
+            }
+            return controller.tabs.map { TabRef(controller: controller, tab: $0) }
+        }
     }
 
     /// Best-effort native window to use as a tab parent for AppleScript commands.
@@ -130,11 +160,6 @@ final class ScriptWindow: NSObject {
     var preferredController: BaseTerminalController? {
         guard NSApp.isAppleScriptEnabled else { return nil }
         return selectedController ?? controllers.first
-    }
-
-    /// Resolves a previously generated tab ID back to a live controller.
-    private func controller(tabID: String) -> BaseTerminalController? {
-        controllers.first(where: { ScriptTab.stableID(controller: $0) == tabID })
     }
 
     /// Live controller list for this scripting window.

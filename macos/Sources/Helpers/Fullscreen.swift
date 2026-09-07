@@ -267,7 +267,6 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
 
         // Restore our saved state
         window.styleMask = savedState.styleMask
-        window.setFrame(window.frameRect(forContentRect: savedState.contentFrame), display: true)
 
         // Removing the "titled" style also derefs all our accessory view controllers
         // so we need to restore those.
@@ -282,6 +281,12 @@ class NonNativeFullscreen: FullscreenBase, FullscreenStyle {
                 window.addTitlebarAccessoryViewController(c)
             }
         }
+
+        // After the accessories, because an accessory in its own row makes the
+        // titlebar taller and `frameRect(forContentRect:)` measures it as it is
+        // now. Restoring the frame first leaves the content short by that row,
+        // and the shortfall compounds every time fullscreen is toggled.
+        window.setFrame(window.frameRect(forContentRect: savedState.contentFrame), display: true)
 
         // Removing "titled" also clears our toolbar
         window.toolbar = savedState.toolbar

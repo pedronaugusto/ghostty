@@ -1228,7 +1228,22 @@ extension SplitTree {
         publisherKeyPath: KeyPath<ViewType, Published<Value>.Publisher>
     ) -> AnyPublisher<[ViewType.ID: Value], Never> {
         // Flatten the split tree into a list of current leaf views.
-        let views = map { $0 }
+        Array(self).valuesPublisher(
+            valueKeyPath: valueKeyPath,
+            publisherKeyPath: publisherKeyPath)
+    }
+}
+
+extension Array where Element: NSView & Identifiable {
+    /// Builds a publisher that emits current values for all views keyed by view ID.
+    ///
+    /// The returned publisher emits a full `[Element.ID: Value]` snapshot whenever
+    /// any view publishes through the provided publisher key path.
+    func valuesPublisher<Value>(
+        valueKeyPath: KeyPath<Element, Value>,
+        publisherKeyPath: KeyPath<Element, Published<Value>.Publisher>
+    ) -> AnyPublisher<[Element.ID: Value], Never> {
+        let views = self
         guard !views.isEmpty else {
             // If there are no leaves, immediately publish an empty snapshot.
             // `Just([:])` keeps the return type simple and makes downstream usage easy.
