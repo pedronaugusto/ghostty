@@ -2331,10 +2331,14 @@ keybind: Keybinds = .{},
 ///
 ///  - `never`
 ///
-///    Never show the tab bar. Tabs are only accessible via the tab
-///    overview or by keybind actions.
+///    Never show the tab bar. Tabs are only accessible by keybind actions,
+///    and on Linux also via the tab overview.
 ///
-/// Currently only supported on Linux (GTK).
+/// On macOS this only applies to the tab bar Ghostty draws itself, i.e. with
+/// `macos-non-native-tabs`. Native tabs use the system tab bar, which follows
+/// the system behavior instead.
+///
+/// Available since: 1.2.0 on GTK, 1.4.0 on macOS
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if
@@ -3387,6 +3391,35 @@ keybind: Keybinds = .{},
 ///
 /// Changing this option at runtime only applies to new windows.
 @"macos-titlebar-style": MacTitlebarStyle = .transparent,
+
+/// Use tabs implemented by Ghostty rather than macOS native window tabs.
+///
+/// macOS implements a tab as a whole window that has been grouped with others,
+/// so a window with three tabs is reported to the rest of the system as three
+/// windows. Tiling window managers read that report and tile every tab as if
+/// it were a window of its own, which breaks the layout. With this set to
+/// `true` a window stays one window however many tabs it holds, and Ghostty
+/// draws the tab bar itself.
+///
+/// Ghostty's tab bar matches the macOS one: the same tab title, tab shortcut,
+/// tab color indicator and close button, in the same places.
+///
+/// The tradeoff is that the macOS features built on window tabs are gone:
+/// "Show All Tabs", and the tab commands the system contributes to the Window
+/// menu. Ghostty supplies its own "Move Tab to New Window" and "Merge All
+/// Windows" in their place.
+///
+/// This composes with `macos-titlebar-style`, which decides where the tab bar
+/// goes: with `macos-titlebar-style = tabs` the bar is drawn in the titlebar
+/// beside the window buttons, otherwise it gets its own row below the
+/// titlebar, which is where macOS puts it. Note that
+/// `macos-titlebar-style = hidden` disallows native tabs entirely, but can
+/// have tabs when this is `true`.
+///
+/// Changing this option at runtime only applies to new windows.
+///
+/// Available since: 1.4.0
+@"macos-non-native-tabs": bool = false,
 
 /// Whether the proxy icon in the macOS titlebar is visible. The proxy icon
 /// is the icon that represents the folder of the current working directory.
