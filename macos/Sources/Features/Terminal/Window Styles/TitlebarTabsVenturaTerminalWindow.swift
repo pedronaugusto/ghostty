@@ -165,7 +165,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     // MARK: Tab Bar Styling
 
     var hasVeryDarkBackground: Bool {
-        backgroundColor.luminance < 0.05
+        backgroundColor.isVeryDarkColor
     }
 
     private var newTabButtonImageLayer: VibrantLayer?
@@ -310,7 +310,7 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
     // This is called by macOS for native tabbing in order to add the tab bar. We hook into
     // this, detect the tab bar being added, and override its behavior.
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
-        let isTabBar = self.titlebarTabs && isTabBar(childViewController)
+        let isTabBar = self.titlebarTabs && isNativeTabBar(childViewController)
 
         if isTabBar {
             // Ensure it has the right layoutAttribute to force it next to our titlebar
@@ -351,6 +351,15 @@ class TitlebarTabsVenturaTerminalWindow: TerminalWindow {
         // Re-enable the main toolbar title
         if let toolbar = toolbar as? TerminalToolbar {
             toolbar.titleIsHidden = false
+        }
+    }
+
+    override func setTitleHiddenForTabBar(_ hidden: Bool) {
+        super.setTitleHiddenForTabBar(hidden)
+
+        // Our title is a toolbar item, which `titleVisibility` doesn't reach.
+        if let toolbar = toolbar as? TerminalToolbar {
+            toolbar.titleIsHidden = hidden
         }
     }
 

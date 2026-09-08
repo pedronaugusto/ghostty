@@ -132,6 +132,7 @@ class TerminalWindow: NSWindow {
             // before this tick. Restoring `.automatic` here would hand tabbing
             // back to AppKit and undo non-native tabs entirely.
             if self.terminalController?.usesNonNativeTabs ?? false { return }
+
             self.tabbingMode = .automatic
         }
 
@@ -246,7 +247,7 @@ class TerminalWindow: NSWindow {
 
         // Its possible we miss the accessory titlebar call so we check again
         // whenever the window becomes main. Both of these are idempotent.
-        if tabBarView != nil {
+        if hasTabBar {
             tabBarDidAppear()
         } else {
             tabBarDidDisappear()
@@ -285,13 +286,19 @@ class TerminalWindow: NSWindow {
     }
 
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
+        // Mark the native bar before it goes in, so everything downstream can
+        // tell the two kinds apart by identifier alone. Ours is marked when it
+        // is created.
+        if isNativeTabBar(childViewController) {
+            childViewController.identifier = Self.tabBarIdentifier
+        }
+
         super.addTitlebarAccessoryViewController(childViewController)
 
         // Tab bar is attached as a titlebar accessory view controller (layout bottom). We
         // can detect when it is shown or hidden by overriding add/remove and searching for
         // it. This has been verified to work on macOS 12 to 26
         if isTabBar(childViewController) {
-            childViewController.identifier = Self.tabBarIdentifier
             tabBarDidAppear()
         }
     }
@@ -310,7 +317,48 @@ class TerminalWindow: NSWindow {
     /// added.
     static let tabBarIdentifier: NSUserInterfaceItemIdentifier = .init("_ghosttyTabBar")
 
+    /// The identifier on the tab bar we draw ourselves.
+    ///
+    /// This is deliberately not `tabBarIdentifier`: everything below that keys
+    /// off that one is a workaround for AppKit's own tab bar, and none of it
+    /// applies to a view we own outright.
+    static let ownTabBarIdentifier: NSUserInterfaceItemIdentifier = .init("_ghosttyOwnTabBar")
+
+    /// Whether a tab bar of either kind is up in this window.
+    ///
+    /// `isTabBar(_:)` answers this for one accessory as it comes and goes. This
+    /// is the one to ask at any other time, because AppKit builds the native
+    /// bar's view some time after its accessory is added.
+    ///
+    /// A window with no titlebar has no bar and cannot be asked: reading
+    /// `titlebarAccessoryViewControllers` on one raises
+    /// `NSInternalInconsistencyException`. `window-decoration = none` and
+    /// non-native fullscreen both take `titled` back out of the style mask.
+    var hasTabBar: Bool {
+        guard styleMask.contains(.titled) else { return false }
+
+        if titlebarAccessoryViewControllers.contains(where: {
+            $0.identifier == Self.ownTabBarIdentifier
+        }) {
+            return true
+        }
+
+        return tabBarView != nil
+    }
+
+    /// Whether an accessory is a tab bar of either kind.
+    ///
+    /// This is what decides whether the rest of the titlebar has to make room.
     func isTabBar(_ childViewController: NSTitlebarAccessoryViewController) -> Bool {
+        if childViewController.identifier == Self.ownTabBarIdentifier { return true }
+        return isNativeTabBar(childViewController)
+    }
+
+    /// Whether an accessory is the tab bar AppKit builds for native tabbing.
+    ///
+    /// The workarounds for that bar -- moving it into the titlebar, leaving it
+    /// out of a fullscreen restore -- must not touch the one we draw ourselves.
+    func isNativeTabBar(_ childViewController: NSTitlebarAccessoryViewController) -> Bool {
         if childViewController.identifier == nil {
             // The good case
             if childViewController.view.contains(className: "NSTabBar") {
@@ -352,6 +400,16 @@ class TerminalWindow: NSWindow {
                 addTitlebarAccessoryViewController(resetZoomAccessory)
             }
         }
+    }
+
+    /// Hide or show this window's own title, because a tab bar is taking its
+    /// place and names the session better than the window can.
+    ///
+    /// `titleVisibility` is enough for a plain titlebar. The titlebar-tabs
+    /// styles keep their title somewhere it doesn't reach, so they override
+    /// this, the same way they already hide it for the native bar.
+    func setTitleHiddenForTabBar(_ hidden: Bool) {
+        titleVisibility = hidden ? .hidden : .visible
     }
 
     // MARK: Tab Key Equivalents
