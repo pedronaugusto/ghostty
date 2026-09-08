@@ -1294,11 +1294,19 @@ extension Ghostty {
                     guard let surface = target.target.surface else { return false }
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
-                    // See gotoTab for notes on this check. A lone tab is already
-                    // a window of its own, so there is nothing to move.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    // See gotoTab for notes on this check.
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView) as? TerminalController,
+                          controller.tabCount > 1 else { return false }
 
-                    surfaceView.window?.moveTabToNewWindow(nil)
+                    // With native tabs a tab is a window, so AppKit has the
+                    // action already. We only have to do it ourselves when we
+                    // are the ones holding the tabs.
+                    if controller.usesNonNativeTabs {
+                        guard let tab = controller.tab(owning: surfaceView) else { return false }
+                        controller.moveTabToNewWindow(tab)
+                    } else {
+                        controller.window?.moveTabToNewWindow(nil)
+                    }
 
                 default:
                     assertionFailure()

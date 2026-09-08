@@ -557,6 +557,7 @@ private struct TerminalTabBarItem<Background: View>: View {
         // VoiceOver never reaches, so activating the element has to do it too.
         .accessibilityAction { model.select(tab) }
         .accessibilityAction(named: "Close Tab") { model.close(tab) }
+        .accessibilityAction(named: "Move Tab to New Window") { model.moveToNewWindow(tab) }
     }
 
     private func beginRename() {

@@ -311,6 +311,20 @@ class TerminalTabDragSourceView: NSView, NSDraggingSource {
             dragOriginController?.accept(tab, at: dragOriginIndex)
             return
         }
+
+        // Dropped on nothing. We give the tab a window of its own where it
+        // landed, which is what dragging a native tab out does. Same rule as
+        // `SurfaceDragSource`.
+        guard operation == [] else { return }
+        let endsInWindow = NSApp.windows.contains { window in
+            window.isVisible && window.frame.contains(screenPoint)
+        }
+        guard !endsInWindow else { return }
+
+        NotificationCenter.default.post(
+            name: .ghosttyTabDragEndedNoTarget,
+            object: tab,
+            userInfo: [Notification.Name.ghosttyTabDragEndedNoTargetPointKey: screenPoint])
     }
 }
 
@@ -443,4 +457,10 @@ struct TerminalTabDropDelegate: DropDelegate {
 
         return true
     }
+}
+
+extension Notification.Name {
+    /// A tab drag ended without a drop target, so the tab becomes a window.
+    static let ghosttyTabDragEndedNoTarget = Notification.Name("com.mitchellh.ghostty.tabDragEndedNoTarget")
+    static let ghosttyTabDragEndedNoTargetPointKey = ghosttyTabDragEndedNoTarget.rawValue + ".point"
 }
