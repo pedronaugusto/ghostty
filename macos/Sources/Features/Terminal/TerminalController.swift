@@ -98,6 +98,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     private var surfaceAppearanceCancellables: Set<AnyCancellable> = []
 
     /// Keeps our own tab bar in step with the tab count.
+    private var tabBarCancellables: Set<AnyCancellable> = []
+
+    /// Our own tab bar, when `macos-non-native-tabs`.
+    private var tabBarAccessory: TerminalTabBarAccessoryViewController?
 
     /// Cancellable for spreading the bell state across our tabs.
     private var tabBellCancellable: AnyCancellable?
@@ -843,6 +847,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // Update our derived config
             self.derivedConfig = DerivedConfig(config)
 
+            // `window-show-tab-bar` decides whether our own bar is installed at
+            // all, so a reload has to act on it.
+            syncTabBarVisibility()
+
             // If we have no surfaces in our window (is that possible?) then we update
             // our window appearance based on the root config. If we have surfaces, we
             // don't call this because focused surface changes will trigger appearance updates.
@@ -862,8 +870,12 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// changes, when a window is closed, and when tabs are reordered
     /// with the mouse.
     func relabelTabs() {
-        // With non-native tabs there is no tab group to label.
-        if usesNonNativeTabs { return }
+        // With non-native tabs there is no tab group to label. Our own bar draws
+        // the same `goto_tab:N` shortcuts, so push them there instead.
+        if usesNonNativeTabs {
+            tabBarAccessory?.refreshShortcuts()
+            return
+        }
 
         // We only listen for frame changes if we have more than 1 window,
         // otherwise the accessory view doesn't matter.
@@ -933,6 +945,14 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             window.titlebarFont = NSFont(name: titleFontName, size: NSFont.systemFontSize)
         } else {
             window.titlebarFont = nil
+        }
+
+        // The tab bar draws in terminal colors, not system colors, so it has to
+        // be resynced alongside the window whenever those change.
+        if let tabBarAccessory {
+            tabBarAccessory.update(
+                backgroundColor: window.preferredBackgroundColor ?? .windowBackgroundColor,
+                font: window.titlebarFont.map { Font($0) } ?? .system(size: 12))
         }
 
         // Call this last in case it uses any of the properties above.
@@ -1561,6 +1581,18 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         window.contentView = container
 
+        // Install our own tab bar when we own the tabs. The bar carries the
+        // session name, so the centered window title is redundant.
+        if usesNonNativeTabs {
+            syncTabBarVisibility()
+            $tabs
+                .map(\.count)
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.syncTabBarVisibility() }
+                .store(in: &tabBarCancellables)
+        }
+
         // If we have a default size, we want to apply it.
         if let defaultSize {
             defaultSize.apply(to: window)
@@ -1636,6 +1668,57 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         super.showWindow(sender)
 
         syncAppearance()
+    }
+
+    override func fullscreenDidChange() {
+        super.fullscreenDidChange()
+
+        // Tab count or visibility may have changed while the titlebar was absent.
+        syncTabBarVisibility()
+    }
+
+    /// Install or remove the tab bar per `window-show-tab-bar`.
+    ///
+    /// The accessory is added and removed rather than hidden: an
+    /// `NSTitlebarAccessoryViewController` marked `isHidden` still occupies the
+    /// titlebar. When the bar is down the window title is the only thing naming
+    /// the session, so it comes back; when the bar is up the centered title
+    /// would only repeat what the active tab already says.
+    private func syncTabBarVisibility() {
+        guard usesNonNativeTabs, let window,
+              window.styleMask.contains(.titled) else { return }
+
+        let visible: Bool
+        switch derivedConfig.windowShowTabBar {
+        case .always: visible = true
+        case .auto: visible = tabs.count > 1
+        case .never: visible = false
+        }
+
+        if visible {
+            let accessory = tabBarAccessory ?? TerminalTabBarAccessoryViewController(controller: self)
+            tabBarAccessory = accessory
+
+            // Reconcile against the window rather than our own record. Taking
+            // `titled` out of the style mask and putting it back, which
+            // non-native fullscreen does, drops every accessory the window had.
+            if !window.titlebarAccessoryViewControllers.contains(accessory) {
+                window.addTitlebarAccessoryViewController(accessory)
+                syncAppearance()
+            }
+        } else {
+            if let accessory = tabBarAccessory,
+               let index = window.titlebarAccessoryViewControllers.firstIndex(of: accessory) {
+                window.removeTitlebarAccessoryViewController(at: index)
+            }
+            tabBarAccessory = nil
+        }
+
+        // The bar sits where the title would, and names the session better, so
+        // the two swap. Each titlebar style knows where its own title lives.
+        if derivedConfig.macosTitlebarStyle == .tabs {
+            (window as? TerminalWindow)?.setTitleHiddenForTabBar(visible)
+        }
     }
 
     // Shows the "+" button in the tab bar, responds to that click.
@@ -2535,6 +2618,28 @@ extension TerminalController {
         return from + min(count - 1 - from, amount)
     }
 
+    /// Insert an existing tab, taking it from whichever controller holds it.
+    ///
+    /// Within one window this is a reorder. Across windows the tab moves, and
+    /// the window it came from closes if it was the last one there. The tab
+    /// object itself moves, so its title override, color and focus come with
+    /// it.
+    func accept(_ tab: TerminalTab, at index: Int) {
+        guard let source = Self.controller(owning: tab) else { return }
+
+        if source === self {
+            guard let from = tabs.firstIndex(where: { $0 === tab }) else { return }
+            moveTab(from: from, to: min(max(index, 0), tabs.count - 1))
+            return
+        }
+
+        guard let sourceIndex = source.tabs.firstIndex(where: { $0 === tab }) else { return }
+        let sourceLocation = TabUndoLocation(controller: source, tab: tab, index: sourceIndex)
+        source.detach(tab)
+        insert(tab, at: index)
+        registerUndoForTabMove(tab, to: sourceLocation, action: "Move Tab")
+    }
+
     /// Where a tab goes back when we undo a move or close.
     /// We only keep the window's placement, not its other sessions.
     struct TabUndoLocation {
@@ -2617,6 +2722,21 @@ extension TerminalController {
             }
 
             return restored
+        }
+    }
+
+    /// Register a move against its tab so closing either window preserves it.
+    private func registerUndoForTabMove(_ tab: TerminalTab, to location: TabUndoLocation, action: String) {
+        guard let undoManager else { return }
+        let undoExpiration = self.undoExpiration
+        let ghostty = self.ghostty
+        undoManager.setActionName(action)
+        undoManager.registerUndo(withTarget: tab, expiresAfter: undoExpiration) { [tab] _ in
+            guard let owner = Self.controller(owning: tab),
+                  let index = owner.tabs.firstIndex(where: { $0 === tab }) else { return }
+            let inverse = TabUndoLocation(controller: owner, tab: tab, index: index)
+            let restored = location.restore(tab, ghostty: ghostty)
+            restored.registerUndoForTabMove(tab, to: inverse, action: action)
         }
     }
 

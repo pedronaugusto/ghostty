@@ -81,12 +81,16 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     // this, detect the tab bar being added, and override its behavior.
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
         // If this is the tab bar then we need to set it up for the titlebar
-        guard isTabBar(childViewController) else {
-            // After dragging a tab into a new window, `hasTabBar` needs to be
-            // updated to properly review window title
-            viewModel.hasTabBar = false
-
+        guard isNativeTabBar(childViewController) else {
             super.addTitlebarAccessoryViewController(childViewController)
+
+            // After dragging a tab into a new window, `hasTabBar` has to be
+            // recomputed so the window title is right. We ask the window what
+            // it is holding now rather than assuming this accessory settles it:
+            // the tab bar we draw ourselves is not the native one but is still
+            // a tab bar, and non-native fullscreen exit puts accessories back
+            // without going through the usual install.
+            viewModel.hasTabBar = hasTabBar
             return
         }
 
@@ -113,7 +117,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
 
     override func removeTitlebarAccessoryViewController(at index: Int) {
         guard let childViewController = titlebarAccessoryViewControllers[safe: index],
-                isTabBar(childViewController) else {
+                isNativeTabBar(childViewController) else {
             super.removeTitlebarAccessoryViewController(at: index)
             return
         }
@@ -223,6 +227,17 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
             DispatchQueue.main.async {
                 self.setupTabBar()
             }
+        }
+    }
+
+    override func setTitleHiddenForTabBar(_ hidden: Bool) {
+        super.setTitleHiddenForTabBar(hidden)
+
+        // Our title is a toolbar item driven by the view model, which
+        // `titleVisibility` doesn't reach. View model updates must happen on
+        // their own ticks because they trigger view updates.
+        DispatchQueue.main.async { [weak self] in
+            self?.viewModel.hasTabBar = hidden
         }
     }
 
