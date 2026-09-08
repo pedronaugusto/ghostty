@@ -740,11 +740,13 @@ class AppDelegate: NSObject,
 
     @objc private func ghosttyNewTab(_ notification: Notification) {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
-        guard let window = surfaceView.window else { return }
 
         // We only want to listen to new tabs if the focused parent is
-        // a regular terminal controller.
-        guard window.windowController is TerminalController else { return }
+        // a regular terminal controller. A surface in a background tab has no
+        // window of its own, so we ask who owns it rather than reading its
+        // view hierarchy.
+        guard let controller = BaseTerminalController.controller(owning: surfaceView) as? TerminalController,
+              let window = controller.window else { return }
 
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
         let config = configAny as? Ghostty.SurfaceConfiguration
@@ -753,9 +755,16 @@ class AppDelegate: NSObject,
     }
 
     private func setDockBadge() {
+        // A window that owns its own tabs can be ringing in more than one of
+        // them, and the badge counts sessions rather than windows.
         let bellCount = NSApp.windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .reduce(0) { $0 + ($1.bell ? 1 : 0) }
+            .reduce(0) { count, controller in
+                if let controller = controller as? TerminalController, controller.usesNonNativeTabs {
+                    return count + controller.tabs.filter(\.bell).count
+                }
+                return count + (controller.bell ? 1 : 0)
+            }
         let wantsBadge = ghostty.config.bellFeatures.contains(.attention) && bellCount > 0
         let label = wantsBadge ? (bellCount > 99 ? "99+" : String(bellCount)) : nil
         NSApp.dockTile.badgeLabel = label
@@ -922,7 +931,7 @@ class AppDelegate: NSObject,
 
     func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView? {
         for c in TerminalController.all {
-            for view in c.surfaceTree where view.id == uuid {
+            for view in c.allSurfaces where view.id == uuid {
                 return view
             }
         }

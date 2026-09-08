@@ -187,9 +187,7 @@ struct TerminalQuery: EntityStringQuery, EnumerableEntityQuery {
         }
 
         // Get all our surfaces
-        return controllers.flatMap {
-            $0.surfaceTree.root?.leaves() ?? []
-        }
+        return controllers.flatMap(\.allSurfaces)
     }
 }
 

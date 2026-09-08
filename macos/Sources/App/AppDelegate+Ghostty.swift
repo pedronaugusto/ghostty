@@ -11,7 +11,7 @@ extension AppDelegate: Ghostty.Delegate {
                 continue
             }
 
-            for surface in controller.surfaceTree where surface.id == id {
+            for surface in controller.allSurfaces where surface.id == id {
                 return surface
             }
         }

@@ -47,10 +47,29 @@ class BaseTerminalController: NSWindowController,
 
     /// The tree of splits within this terminal window.
     @Published var surfaceTree: SplitTree<Ghostty.SurfaceView> = .init() {
-        didSet {
-            Self.updateSurfaceControllers(self, from: oldValue, to: surfaceTree)
-            surfaceTreeDidChange(from: oldValue, to: surfaceTree)
-        }
+        didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
+    }
+
+    /// Every surface this controller owns.
+    ///
+    /// For a controller that shows everything it owns this is just `surfaceTree`.
+    /// A subclass that keeps surfaces off screen has more of them (see
+    /// `TerminalController` and its tabs), so anything that is a property of the
+    /// window rather than of what's on screen -- quit confirmation, occlusion,
+    /// teardown -- has to ask for this instead.
+    var allSurfaces: [Ghostty.SurfaceView] {
+        Array(surfaceTree)
+    }
+
+    /// How many tabs this window holds, this one included, however tabs are
+    /// implemented.
+    ///
+    /// A controller that doesn't implement tabs itself has whatever macOS
+    /// native tabbing gave its window. Callers deciding whether a tab action is
+    /// possible must use this rather than reading `tabGroup`, which is empty by
+    /// design for a window that owns its own tabs.
+    var tabCount: Int {
+        window?.tabGroup?.windows.count ?? (window == nil ? 0 : 1)
     }
 
     /// This can be set to show/hide the command palette.
@@ -97,13 +116,20 @@ class BaseTerminalController: NSWindowController,
     /// Cancellable for aggregating bell state across all surfaces in this controller.
     private var bellStateCancellable: AnyCancellable?
 
+    /// How many of our surfaces were ringing when we last said so.
+    private var ringingSurfaces: Int = 0
+
     /// Cancellable for clipboard confirmation requests from surfaces in this controller.
     private var clipboardConfirmationCancellable: AnyCancellable?
+
+    /// Signals that the set of surfaces in this window may have changed. Sent
+    /// after the change is committed, unlike `@Published`. See `allSurfacesPublisher`.
+    let surfacesDidChangeSubject = CurrentValueSubject<Void, Never>(())
 
     /// An override title for the tab/window set by the user via prompt_tab_title.
     /// When set, this takes precedence over the computed title from the terminal.
     var titleOverride: String? {
-        didSet { applyTitleToWindow() }
+        didSet { titleOverrideDidChange() }
     }
 
     /// The last computed title from the focused surface (without the override).
@@ -247,18 +273,41 @@ class BaseTerminalController: NSWindowController,
     /// view relationship.
     static func controller(owning surface: Ghostty.SurfaceView) -> BaseTerminalController? {
         if let controller = surfaceControllers.object(forKey: surface),
-           controller.surfaceTree.contains(surface) {
+           controller.owns(surface) {
             return controller
         }
 
         if let controller = surface.window?.windowController as? BaseTerminalController,
-           controller.surfaceTree.contains(surface) {
+           controller.owns(surface) {
             return controller
         }
 
         return NSApp.windows
             .compactMap { $0.windowController as? BaseTerminalController }
-            .first { $0.surfaceTree.contains(surface) }
+            .first { $0.owns(surface) }
+    }
+
+    /// Whether this controller owns the given surface, on screen or not.
+    ///
+    /// This is the test the ownership map is kept in step with, so a subclass
+    /// that holds surfaces outside `surfaceTree` has to widen it.
+    func owns(_ surface: Ghostty.SurfaceView) -> Bool {
+        surfaceTree.contains(surface)
+    }
+
+    /// Whether this controller owns the given split node, on screen or not.
+    func owns(_ node: SplitTree<Ghostty.SurfaceView>.Node) -> Bool {
+        surfaceTree.contains(node)
+    }
+
+    /// The split tree holding a surface we own, on screen or not.
+    func tree(containing surface: Ghostty.SurfaceView) -> SplitTree<Ghostty.SurfaceView>? {
+        surfaceTree.contains(surface) ? surfaceTree : nil
+    }
+
+    /// Set the title override for the session a surface belongs to.
+    func setTitleOverride(_ override: String?, for surface: Ghostty.SurfaceView) {
+        titleOverride = override
     }
 
     private static func updateSurfaceControllers(
@@ -266,8 +315,11 @@ class BaseTerminalController: NSWindowController,
         from oldTree: SplitTree<Ghostty.SurfaceView>,
         to newTree: SplitTree<Ghostty.SurfaceView>
     ) {
+        // A surface leaving this tree hasn't necessarily left the controller, so
+        // we only release the ones it no longer owns at all.
         for surface in oldTree where !newTree.contains(surface) {
-            if surfaceControllers.object(forKey: surface) === controller {
+            if surfaceControllers.object(forKey: surface) === controller,
+               !controller.owns(surface) {
                 surfaceControllers.removeObject(forKey: surface)
             }
         }
@@ -284,8 +336,11 @@ class BaseTerminalController: NSWindowController,
         direction: SplitTree<Ghostty.SurfaceView>.NewDirection,
         baseConfig config: Ghostty.SurfaceConfiguration? = nil
     ) -> Ghostty.SurfaceView? {
-        // We can only create new splits for surfaces in our tree.
-        guard surfaceTree.root?.node(view: oldView) != nil else { return nil }
+        // We can only create new splits for surfaces in a tree we own. That
+        // isn't always the one on screen: AppleScript splits a terminal it
+        // names, without focusing it first.
+        guard let tree = tree(containing: oldView),
+              tree.root?.node(view: oldView) != nil else { return nil }
 
         // Create a new surface view
         guard let ghostty_app = ghostty.app else { return nil }
@@ -294,7 +349,7 @@ class BaseTerminalController: NSWindowController,
         // Do the split
         let newTree: SplitTree<Ghostty.SurfaceView>
         do {
-            newTree = try surfaceTree.inserting(
+            newTree = try tree.inserting(
                 view: newView,
                 at: oldView,
                 direction: direction)
@@ -308,6 +363,7 @@ class BaseTerminalController: NSWindowController,
 
         replaceSurfaceTree(
             newTree,
+            containing: oldView,
             moveFocusTo: newView,
             moveFocusFrom: oldView,
             undoAction: "New Split")
@@ -315,10 +371,38 @@ class BaseTerminalController: NSWindowController,
         return newView
     }
 
+    /// Replace the tree that a surface we own lives in.
+    ///
+    /// The base controller has one tree, so this is `replaceSurfaceTree`. A
+    /// subclass that holds trees it isn't showing writes into the right one.
+    /// This is the counterpart of `removeSurfaceNode(_:)`, which routes by node.
+    func replaceSurfaceTree(
+        _ newTree: SplitTree<Ghostty.SurfaceView>,
+        containing surface: Ghostty.SurfaceView,
+        moveFocusTo newView: Ghostty.SurfaceView? = nil,
+        moveFocusFrom oldView: Ghostty.SurfaceView? = nil,
+        undoAction: String? = nil
+    ) {
+        replaceSurfaceTree(
+            newTree,
+            moveFocusTo: newView,
+            moveFocusFrom: oldView,
+            undoAction: undoAction)
+    }
+
+    /// Get a surface ready to take focus, and report whether we can give it any.
+    ///
+    /// A controller that shows everything it owns has nothing to do here beyond
+    /// saying whether the surface is one of ours. A subclass that keeps surfaces
+    /// off screen puts this one on screen first, because `Ghostty.moveFocus`
+    /// waits for the target to have a window and then gives up.
+    func prepareToFocusSurface(_ view: Ghostty.SurfaceView) -> Bool {
+        surfaceTree.contains(view)
+    }
+
     /// Move focus to a surface view.
     func focusSurface(_ view: Ghostty.SurfaceView) {
-        // Check if target surface is in our tree
-        guard surfaceTree.contains(view) else { return }
+        guard prepareToFocusSurface(view) else { return }
 
         // Move focus to the target surface and activate the window/app
         DispatchQueue.main.async {
@@ -332,24 +416,48 @@ class BaseTerminalController: NSWindowController,
 
     /// Called when the surfaceTree variable changed.
     ///
-    /// Subclasses should call super first.
+    /// This runs the bookkeeping every surface we own is entitled to, and it
+    /// reads `owns` to do it. A subclass that keeps its own record of what it
+    /// owns therefore updates that record BEFORE calling super, which is the
+    /// opposite of the usual order.
     func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
-        for surfaceView in from where !to.contains(surfaceView) {
-            cancelPendingClipboardConfirmation(for: surfaceView)
-        }
+        ownedTreeDidChange(from: from, to: to)
 
         // If our surface tree becomes empty then we have no focused surface.
         if to.isEmpty {
             focusedSurface = nil
         }
+    }
+
+    /// Update the surface controller registry, cancel clipboard confirmations
+    /// for surfaces that left us, resync occlusion and publish the new set.
+    ///
+    /// `surfaceTreeDidChange` is this plus the part that only means anything
+    /// for the tree we're showing. A subclass that holds trees it isn't showing
+    /// calls this for those.
+    ///
+    /// Settle both the record of what we own and whatever names the on-screen
+    /// tree before calling: this reads the first to decide what we let go of,
+    /// and the second for occlusion and the clipboard sheet.
+    func ownedTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
+        Self.updateSurfaceControllers(self, from: from, to: to)
+
+        // A surface leaving this tree hasn't necessarily left us, and a
+        // confirmation we're still going to show belongs to the surface, not to
+        // the view it happened to be in.
+        for surfaceView in from where !owns(surfaceView) {
+            cancelPendingClipboardConfirmation(for: surfaceView)
+        }
+
         syncSurfaceTreeOcclusionState()
+        surfacesDidChangeSubject.send()
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
     /// what surface is focused. This must be called whenever a surface OR window changes focus.
     func syncFocusToSurfaceTree() {
         var newlyFocused: Ghostty.SurfaceView?
-        for surfaceView in surfaceTree {
+        for surfaceView in allSurfaces {
             // Our focus state requires that this window is key and our currently
             // focused surface is the surface in this view.
             let focused: Bool = (window?.isKeyWindow ?? false) &&
@@ -425,6 +533,26 @@ class BaseTerminalController: NSWindowController,
 
     /// Prompt the user to change the tab/window title.
     func promptTabTitle() {
+        presentTabTitleSheet { [weak self] newTitle in
+            self?.titleOverride = newTitle
+        }
+    }
+
+    /// Prompt the user to change the title of the session a surface belongs to.
+    func promptTabTitle(for surface: Ghostty.SurfaceView) {
+        presentTabTitleSheet { [weak self] newTitle in
+            self?.setTitleOverride(newTitle, for: surface)
+        }
+    }
+
+    /// Show the title sheet and hand what the user entered to `apply`. A blank
+    /// field means "restore the default" and arrives as nil.
+    ///
+    /// The window stays usable while the sheet is up, so what the sheet was
+    /// opened for can stop being what is on screen before it is dismissed.
+    /// Callers say up front what the answer applies to rather than letting the
+    /// completion handler pick a target when it finally runs.
+    func presentTabTitleSheet(_ apply: @escaping (String?) -> Void) {
         guard let window else { return }
 
         let alert = NSAlert()
@@ -441,16 +569,11 @@ class BaseTerminalController: NSWindowController,
 
         alert.window.initialFirstResponder = textField
 
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self else { return }
+        alert.beginSheetModal(for: window) { response in
             guard response == .alertFirstButtonReturn else { return }
 
             let newTitle = textField.stringValue
-            if newTitle.isEmpty {
-                self.titleOverride = nil
-            } else {
-                self.titleOverride = newTitle
-            }
+            apply(newTitle.isEmpty ? nil : newTitle)
         }
     }
 
@@ -470,8 +593,8 @@ class BaseTerminalController: NSWindowController,
         _ node: SplitTree<Ghostty.SurfaceView>.Node,
         withConfirmation: Bool = true
     ) {
-        // This node must be part of our tree
-        guard surfaceTree.contains(node) else { return }
+        // This node must be part of a tree we own
+        guard owns(node) else { return }
 
         // If the child process is not alive, then we exit immediately
         guard withConfirmation else {
@@ -498,15 +621,18 @@ class BaseTerminalController: NSWindowController,
 
     /// Find the next surface to focus when a node is being closed.
     /// Goes to previous split unless we're the leftmost leaf, then goes to next.
-    private func findNextFocusTargetAfterClosing(node: SplitTree<Ghostty.SurfaceView>.Node) -> Ghostty.SurfaceView? {
-        guard let root = surfaceTree.root else { return nil }
+    static func findNextFocusTargetAfterClosing(
+        node: SplitTree<Ghostty.SurfaceView>.Node,
+        in tree: SplitTree<Ghostty.SurfaceView>
+    ) -> Ghostty.SurfaceView? {
+        guard let root = tree.root else { return nil }
 
         // If we're the leftmost, then we move to the next surface after closing.
         // Otherwise, we move to the previous.
         if root.leftmostLeaf() == node.leftmostLeaf() {
-            return surfaceTree.focusTarget(for: .next, from: node)
+            return tree.focusTarget(for: .next, from: node)
         } else {
-            return surfaceTree.focusTarget(for: .previous, from: node)
+            return tree.focusTarget(for: .previous, from: node)
         }
     }
 
@@ -515,12 +641,12 @@ class BaseTerminalController: NSWindowController,
     /// This also updates the undo manager to support restoring this node.
     ///
     /// This does no confirmation and assumes confirmation is already done.
-    private func removeSurfaceNode(_ node: SplitTree<Ghostty.SurfaceView>.Node) {
+    func removeSurfaceNode(_ node: SplitTree<Ghostty.SurfaceView>.Node) {
         // Move focus if the closed surface was focused and we have a next target
         let nextFocus: Ghostty.SurfaceView? = if node.contains(
             where: { $0 == focusedSurface }
         ) {
-            findNextFocusTargetAfterClosing(node: node)
+            Self.findNextFocusTargetAfterClosing(node: node, in: surfaceTree)
         } else {
             nil
         }
@@ -657,16 +783,14 @@ class BaseTerminalController: NSWindowController,
 
     @objc private func ghosttyDidCloseSurface(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard let node = surfaceTree.root?.node(view: target) else { return }
         closeSurface(
-            node,
+            target,
             withConfirmation: (notification.userInfo?["process_alive"] as? Bool) ?? false)
     }
 
     @objc private func ghosttyDidNewSplit(_ notification: Notification) {
-        // The target must be within our tree
         guard let oldView = notification.object as? Ghostty.SurfaceView else { return }
-        guard surfaceTree.root?.node(view: oldView) != nil else { return }
+        guard owns(oldView) else { return }
 
         // Notification must contain our base config
         let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
@@ -792,7 +916,7 @@ class BaseTerminalController: NSWindowController,
 
     @objc private func ghosttyDidPresentTerminal(_ notification: Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
-        guard surfaceTree.contains(target) else { return }
+        guard prepareToFocusSurface(target) else { return }
 
         // Bring the window to front and focus the surface.
         window?.makeKeyAndOrderFront(nil)
@@ -818,7 +942,7 @@ class BaseTerminalController: NSWindowController,
         // keep track of our old one so undo sends focus back to the right place.
         let oldFocusedSurface = focusedSurface
         if focusedSurface == target {
-            focusedSurface = findNextFocusTargetAfterClosing(node: targetNode)
+            focusedSurface = Self.findNextFocusTargetAfterClosing(node: targetNode, in: surfaceTree)
         }
 
         // Remove the surface from our tree
@@ -913,6 +1037,14 @@ class BaseTerminalController: NSWindowController,
         applyTitleToWindow()
     }
 
+    /// Called when `titleOverride` changes.
+    ///
+    /// Subclasses that keep an override of their own record it before calling
+    /// super, the same way they do for `surfaceTreeDidChange`.
+    func titleOverrideDidChange() {
+        applyTitleToWindow()
+    }
+
     private func applyTitleToWindow() {
         guard let window else { return }
 
@@ -997,20 +1129,11 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
-        // Source is not in our tree - search other windows
-        var sourceController: BaseTerminalController?
-        var sourceNode: SplitTree<Ghostty.SurfaceView>.Node?
-        for window in NSApp.windows {
-            guard let controller = window.windowController as? BaseTerminalController else { continue }
-            guard controller !== self else { continue }
-            if let node = controller.surfaceTree.root?.node(view: source) {
-                sourceController = controller
-                sourceNode = node
-                break
-            }
-        }
-
-        guard let sourceController, let sourceNode else {
+        // Source is not in the tree we're showing. It may be in another
+        // window, or in a session of ours that isn't on screen, so we ask who
+        // owns it rather than searching visible trees.
+        guard let sourceController = Self.controller(owning: source),
+              let sourceNode = sourceController.tree(containing: source)?.root?.node(view: source) else {
             Ghostty.logger.warning("source surface not found in any window during drop")
             return
         }
@@ -1199,13 +1322,14 @@ class BaseTerminalController: NSWindowController,
         guard window != nil else { return true }
 
         // If we have no surfaces, close.
-        if surfaceTree.isEmpty { return true }
+        let surfaces = allSurfaces
+        if surfaces.isEmpty { return true }
 
         // If we already have an alert, continue with it
         guard alert == nil else { return false }
 
         // If our surfaces don't require confirmation, close.
-        if !surfaceTree.contains(where: { $0.needsConfirmQuit }) { return true }
+        if !surfaces.contains(where: { $0.needsConfirmQuit }) { return true }
 
         return false
     }
@@ -1231,7 +1355,7 @@ class BaseTerminalController: NSWindowController,
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
 
-        for surfaceView in surfaceTree {
+        for surfaceView in allSurfaces {
             cancelPendingClipboardConfirmation(for: surfaceView)
         }
 
@@ -1283,8 +1407,11 @@ class BaseTerminalController: NSWindowController,
     }
 
     private func syncSurfaceTreeOcclusionState() {
-        let visible = self.window?.occlusionState.contains(.visible) ?? false
-        for view in surfaceTree {
+        let windowVisible = self.window?.occlusionState.contains(.visible) ?? false
+        for view in allSurfaces {
+            // A surface we own but don't show is not on screen at all, whatever
+            // the window's occlusion state says.
+            let visible = windowVisible && surfaceTree.contains(view)
             if let surface = view.surface, view.isWindowVisible != visible {
                 ghostty_surface_set_occlusion(surface, visible)
                 view.isWindowVisible = visible
@@ -1530,7 +1657,9 @@ extension BaseTerminalController: NSMenuItemValidation {
         guard scheme != appliedColorScheme else {
             return
         }
-        for surfaceView in surfaceTree {
+        // Every surface, not only the visible ones: `appliedColorScheme` is
+        // per controller, so a surface we skipped here would never be caught up.
+        for surfaceView in allSurfaces {
             if let surface = surfaceView.surface {
                 ghostty_surface_set_color_scheme(surface, scheme)
             }
@@ -1544,10 +1673,10 @@ extension BaseTerminalController: NSMenuItemValidation {
 extension BaseTerminalController {
     /// Presents clipboard confirmations published by surfaces in this controller.
     private func setupClipboardConfirmationPublisher() {
-        clipboardConfirmationCancellable = $surfaceTree
-            // Rebuild the merged publisher whenever the split tree changes.
-            .map { tree in
-                Publishers.MergeMany(tree.map { surface in
+        clipboardConfirmationCancellable = allSurfacesPublisher
+            // Rebuild the merged publisher whenever the surfaces change.
+            .map { surfaces in
+                Publishers.MergeMany(surfaces.map { surface in
                     // Carry the stable value-type ID rather than capturing the
                     // surface in the operator chain. The subscription therefore
                     // cannot extend the SurfaceView's lifetime.
@@ -1569,7 +1698,7 @@ extension BaseTerminalController {
             // avoid controller -> cancellable -> sink -> controller.
             .sink { [weak self] id, request in
                 guard let self,
-                      let surface = surfaceTree.first(where: { $0.id == id }) else { return }
+                      let surface = allSurfaces.first(where: { $0.id == id }) else { return }
                 onConfirmClipboardRequest(request, for: surface)
             }
     }
@@ -1693,11 +1822,18 @@ extension BaseTerminalController {
     /// bell state changes.
     private func setupBellNotificationPublisher() {
         bellStateCancellable = surfaceValuesPublisher(valueKeyPath: \.bell, publisherKeyPath: \.$bell)
-            .map { $0.values.contains(true) }
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] hasBell in
+            .sink { [weak self] bells in
                 guard let self else { return }
+
+                // On the count rather than on `bell`, because the dock badge
+                // counts sessions: a second surface ringing in a window that
+                // was already ringing is a change it has to hear about.
+                let ringing = bells.values.filter { $0 }.count
+                guard ringing != ringingSurfaces else { return }
+                ringingSurfaces = ringing
+                let hasBell = ringing > 0
                 bell = hasBell
                 NotificationCenter.default.post(
                     name: .terminalWindowBellDidChangeNotification,
@@ -1707,27 +1843,40 @@ extension BaseTerminalController {
             }
     }
 
-    /// Creates a publisher for values on all surfaces in this controller's tree.
+    /// Creates a publisher for values on every surface this controller owns.
     ///
-    /// The publisher emits a dictionary of surface IDs to values whenever the tree changes
-    /// or any surface publishes a new value for the key path.
+    /// The publisher emits a dictionary of surface IDs to values whenever that set
+    /// changes or any surface publishes a new value for the key path.
     func surfaceValuesPublisher<Value>(
         valueKeyPath: KeyPath<Ghostty.SurfaceView, Value>,
         publisherKeyPath: KeyPath<Ghostty.SurfaceView, Published<Value>.Publisher>
     ) -> AnyPublisher<[Ghostty.SurfaceView.ID: Value], Never> {
-        // `surfaceTree` can be replaced entirely when splits are added/removed/closed.
-        // For each tree snapshot we build a fresh publisher that watches all surfaces
-        // in that snapshot.
-        $surfaceTree
-            .map { tree in
-                tree.valuesPublisher(
+        // The surface set can be replaced entirely when splits or tabs are
+        // added/removed/closed. For each snapshot we build a fresh publisher
+        // that watches all surfaces in that snapshot.
+        allSurfacesPublisher
+            .map { surfaces in
+                surfaces.valuesPublisher(
                     valueKeyPath: valueKeyPath,
                     publisherKeyPath: publisherKeyPath
                 )
             }
-            // Keep only the latest tree publisher active. This automatically cancels
-            // subscriptions for old/removed surfaces when the tree changes.
+            // Keep only the latest snapshot's publisher active. This automatically
+            // cancels subscriptions for surfaces that are gone.
             .switchToLatest()
+            .eraseToAnyPublisher()
+    }
+
+    /// Emits every surface this controller owns whenever that set can have
+    /// changed.
+    ///
+    /// This is driven by an explicit subject rather than `$surfaceTree` because
+    /// `@Published` emits from `willSet`, so a subscriber reading back through
+    /// the controller would see the state that is being replaced.
+    /// `surfacesDidChangeSubject` is sent once the change is committed.
+    var allSurfacesPublisher: AnyPublisher<[Ghostty.SurfaceView], Never> {
+        surfacesDidChangeSubject
+            .compactMap { [weak self] in self?.allSurfaces }
             .eraseToAnyPublisher()
     }
 }
