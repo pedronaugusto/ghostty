@@ -58,7 +58,7 @@ extension TerminalRestorable {
 
 /// The state stored for terminal window restoration.
 final class TerminalRestorableState: TerminalRestorable {
-    static var version: Int { 7 }
+    static var version: Int { 8 }
     static var minimumVersion: Int { 5 }
 
     var focusedSurface: String? {
@@ -75,6 +75,12 @@ final class TerminalRestorableState: TerminalRestorable {
     }
     var titleOverride: String? {
         internalState.titleOverride
+    }
+    var tabs: [InternalState<Ghostty.SurfaceView>.TabState]? {
+        internalState.tabs
+    }
+    var activeTabIndex: Int? {
+        internalState.activeTabIndex
     }
 
     /// Internal State we use to perform unit tests
@@ -171,11 +177,16 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // Restore the tab title override
         c.titleOverride = state.titleOverride
 
+        if c.usesNonNativeTabs {
+            restoreTabs(state, into: c)
+        }
+
         // Setup our restored state on the controller
-        // Find the focused surface in surfaceTree
+        // Find the focused surface. Every tab is searched rather than just the
+        // active tree, because the controller now owns more than one.
         if let focusedStr = state.focusedSurface {
             var foundView: Ghostty.SurfaceView?
-            for view in c.surfaceTree where view.id.uuidString == focusedStr {
+            for view in c.allSurfaces where view.id.uuidString == focusedStr {
                 foundView = view
                 break
             }
@@ -187,6 +198,13 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
 
         completionHandler(window, nil)
+        if !c.usesNonNativeTabs {
+            // AppKit has to finish restoring the original window before we
+            // can add anything to its native tab group.
+            DispatchQueue.main.async {
+                restoreTabs(state, into: c)
+            }
+        }
         guard let mode = state.effectiveFullscreenMode, mode != .native else {
             // We let AppKit handle native fullscreen
             return
@@ -194,6 +212,68 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // Give the window to AppKit first, then adjust its frame and style
         // to minimise any visible frame changes.
         c.toggleFullscreen(mode: mode)
+    }
+
+    /// Rebuild every tab in a restored window.
+    ///
+    /// The controller already holds the active tab. Tabs before it are inserted
+    /// ahead of it and tabs after it appended, so the original order and the
+    /// original selection both come back.
+    private static func restoreTabs(_ state: TerminalRestorableState, into c: TerminalController) {
+        guard let tabs = state.tabs, tabs.count > 1 else { return }
+
+        let activeIndex = min(max(state.activeTabIndex ?? 0, 0), tabs.count - 1)
+
+        // The controller's one existing tab is the active one, so give it the
+        // rest of its saved state before anything else moves. Its focus has to
+        // be part of that: adding a tab selects it, so the active tab is
+        // reselected at the end of this and `selectTab(at:)` focuses what the
+        // tab remembers. A tab that remembers nothing falls back to its first
+        // leaf, which would then race the window's own focus restoration.
+        if let active = c.activeTab {
+            active.titleOverride = tabs[activeIndex].titleOverride
+            if let color = tabs[activeIndex].tabColor { active.tabColor = color }
+            if let focused = tabs[activeIndex].focusedSurface {
+                active.focusedSurface = active.surfaces.first { $0.id.uuidString == focused }
+                active.observeTitle()
+            }
+        }
+
+        var previousWindow = c.window
+        for (index, tab) in tabs.enumerated() where index != activeIndex {
+            guard !tab.surfaceTree.isEmpty else { continue }
+
+            if !c.usesNonNativeTabs {
+                let restored = c.restoreNativeTab(
+                    tree: tab.surfaceTree,
+                    titleOverride: tab.titleOverride,
+                    tabColor: tab.tabColor,
+                    focusedSurface: tab.focusedSurface.flatMap { UUID(uuidString: $0) },
+                    relativeTo: index < activeIndex ? c.window : previousWindow,
+                    ordered: index < activeIndex ? .below : .above)
+                if index > activeIndex, let restored { previousWindow = restored }
+                continue
+            }
+
+            // Ascending order means slots 0..<index hold their final tabs by
+            // the time we get here -- the active tab included, pushed along by
+            // the inserts before it -- so `index` is where this one goes.
+            guard let created = c.addTab(surfaceTree: tab.surfaceTree, at: index) else { continue }
+
+            created.titleOverride = tab.titleOverride
+            if let color = tab.tabColor { created.tabColor = color }
+            if let focused = tab.focusedSurface {
+                created.focusedSurface = created.surfaces.first { $0.id.uuidString == focused }
+                created.observeTitle()
+            }
+        }
+
+        if c.usesNonNativeTabs {
+            c.selectTab(at: activeIndex)
+        } else {
+            c.activeTabDidChange()
+            c.window?.tabGroup?.selectedWindow = c.window
+        }
     }
 
     /// This restores the focus state of the surfaceview within the given window. When restoring,

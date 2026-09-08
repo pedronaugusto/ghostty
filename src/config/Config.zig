@@ -3376,7 +3376,8 @@ keybind: Keybinds = .{},
 /// color of the terminal. There are some limitations to this style:
 /// On macOS 13 and below, saved window state will not restore native tabs
 /// correctly. macOS 14 does not have this issue and any other macOS version
-/// has not been tested.
+/// has not been tested. `macos-non-native-tabs` saves and restores its own
+/// tabs, so it is not affected.
 ///
 /// The "hidden" style hides the titlebar. Unlike `window-decoration = none`,
 /// however, it does not remove the frame from the window or cause it to have

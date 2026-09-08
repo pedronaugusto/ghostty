@@ -6,7 +6,7 @@ import AppKit
 struct TerminalRestorableTests {
     @Test
     func areYouForgettingToAddMigrationTests() {
-        #expect(TerminalRestorableState.version == 7)
+        #expect(TerminalRestorableState.version == 8)
         #expect(TerminalRestorableState.minimumVersion == 5)
 
         #expect(QuickTerminalRestorableState.version == 1)
@@ -58,6 +58,8 @@ struct TerminalRestorableTests {
         #expect(v5.effectiveFullscreenMode == nil)
         #expect(v5.tabColor == nil)
         #expect(v5.titleOverride == nil)
+        #expect(v5.tabs == nil)
+        #expect(v5.activeTabIndex == nil)
         #expect(v5.surfaceTree.contains(where: { $0.id.uuidString == "926F3F2A-824C-40C9-87CA-2CDCA4E11049" }))
         #expect(v5.surfaceTree.contains(where: { $0.id.uuidString == "AC5E829B-85FD-4C69-B196-2EE469C72A90" }))
 
@@ -81,6 +83,8 @@ struct TerminalRestorableTests {
         #expect(v7.effectiveFullscreenMode == .native)
         #expect(v7.tabColor == .green)
         #expect(v7.titleOverride == "1.3.0")
+        #expect(v7.tabs == nil)
+        #expect(v7.activeTabIndex == nil)
         #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "5D580A7A-81EA-47C6-BB9A-AD4B1783E478" }))
         #expect(v7.surfaceTree.contains(where: { $0.id.uuidString == "96EA1189-7482-41BC-A6CD-26E5190E4BFA" }))
 
@@ -109,7 +113,133 @@ struct TerminalRestorableTests {
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "953CE952-D91D-4D36-AC72-9D0F1F6BCE73" }))
         #expect(v7Generic.surfaceTree.contains(where: { $0.id.uuidString == "D3223569-2E01-4BC5-9DB2-DBFC3AFF46D1" }))
     }
+
+    /// Version 8 adds the full tab list. The version 5 fields keep describing
+    /// the active tab so an older Ghostty reading this blob still restores it.
+    @MainActor
+    @Test func restoreTerminal8() throws {
+
+//        let tab0 = try SplitTreeTests.makeHorizontalSplit()
+//        let tab1 = try SplitTreeTests.makeHorizontalSplit()
+//        let state = DummyTerminalRestorableState(
+//            .init(
+//                focusedSurface: "v8",
+//                surfaceTree: tab1.0,
+//                effectiveFullscreenMode: nil,
+//                tabColor: .green,
+//                titleOverride: "second",
+//                tabs: [
+//                    .init(surfaceTree: tab0.0, focusedSurface: "tab0", titleOverride: "first", tabColor: .blue),
+//                    .init(surfaceTree: tab1.0, focusedSurface: "v8", titleOverride: "second", tabColor: .green),
+//                ],
+//                activeTabIndex: 1
+//            )
+//        )
+//        let data = try archive(CodableBridge(state), className: "CodableBridge<Terminal>")
+//        print(data.base64EncodedString())
+//        print()
+//        print(tab0.1.id)
+//        print(tab1.1.id)
+
+        let v8 = try unarchive(v8Data, className: "CodableBridge<Terminal>", as: CodableBridge<DummyTerminalRestorableState>.self)
+            .value.internalState
+
+        #expect(v8.focusedSurface == "v8")
+        #expect(v8.titleOverride == "second")
+        #expect(v8.tabColor == .green)
+        #expect(v8.activeTabIndex == 1)
+
+        let tabs = try #require(v8.tabs)
+        #expect(tabs.count == 2)
+        #expect(tabs[0].titleOverride == "first")
+        #expect(tabs[0].tabColor == TerminalTabColor.blue)
+        #expect(tabs[0].focusedSurface == "tab0")
+        #expect(tabs[1].titleOverride == "second")
+        #expect(tabs[1].tabColor == TerminalTabColor.green)
+        #expect(tabs[0].surfaceTree.contains(where: { $0.id.uuidString == v8Tab0Left }))
+        #expect(tabs[1].surfaceTree.contains(where: { $0.id.uuidString == v8Tab1Left }))
+        let activeSurface = try #require(v8.surfaceTree.first)
+        #expect(tabs[1].surfaceTree.contains { $0 === activeSurface })
+    }
+
+    /// A tab running a command is not saved, so the active index has to be
+    /// re-derived against the tabs that survive rather than carried over.
+    @Test func savedTabsDropCommandsAndReindexTheActiveTab() {
+        typealias State = TerminalRestorableState.InternalState<MockView>
+
+        // Nothing dropped: everything is carried across unchanged.
+        var result = State.saved(restorable: [true, true, true], active: 1)
+        #expect(result.kept == [0, 1, 2])
+        #expect(result.active == 1)
+
+        // A command tab before the active one shifts it down.
+        result = State.saved(restorable: [false, true, true], active: 2)
+        #expect(result.kept == [1, 2])
+        #expect(result.active == 1)
+
+        // Two before it.
+        result = State.saved(restorable: [false, false, true, true], active: 3)
+        #expect(result.kept == [2, 3])
+        #expect(result.active == 1)
+
+        // Command tabs after the active one don't move it.
+        result = State.saved(restorable: [true, true, false], active: 1)
+        #expect(result.kept == [0, 1])
+        #expect(result.active == 1)
+
+        // The active tab is itself dropped: the selection falls to the nearest
+        // tab that survived, and never off the end.
+        result = State.saved(restorable: [true, false, true], active: 1)
+        #expect(result.kept == [0, 2])
+        #expect(result.active == 1)
+
+        result = State.saved(restorable: [true, true, false], active: 2)
+        #expect(result.kept == [0, 1])
+        #expect(result.active == 1)
+
+        result = State.saved(restorable: [false, true, true], active: 0)
+        #expect(result.kept == [1, 2])
+        #expect(result.active == 0)
+
+        // A window of nothing but command tabs saves nothing. This is also when
+        // the window reports isRestorable == false, so it is never written.
+        result = State.saved(restorable: [false, false], active: 1)
+        #expect(result.kept.isEmpty)
+        #expect(result.active == nil)
+
+        result = State.saved(restorable: [], active: 0)
+        #expect(result.kept.isEmpty)
+        #expect(result.active == nil)
+    }
+
+    @MainActor
+    @Test(arguments: [-3, 0, 1, 30])
+    func restoreTerminal8SkipsLegacyTree(activeIndex: Int) throws {
+        let original = try unarchive(v8Data, className: "CodableBridge<Terminal>", as: CodableBridge<DummyTerminalRestorableState>.self)
+            .value.internalState
+        let encoded = try JSONEncoder().encode(original)
+        var object = try #require(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        #expect(object["surfaceTree"] is [String: Any])
+        object["surfaceTree"] = "must not be decoded"
+        object["activeTabIndex"] = activeIndex
+
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let restored = try JSONDecoder().decode(TerminalRestorableState.InternalState<MockView>.self, from: data)
+        let tabs = try #require(restored.tabs)
+        let activeSurface = try #require(restored.surfaceTree.first)
+        #expect(tabs[min(max(activeIndex, 0), tabs.count - 1)].surfaceTree.contains { $0 === activeSurface })
+    }
 }
+
+/// Surface IDs baked into `v8Data`.
+private let v8Tab0Left = "3FC5B3C6-5A2B-4E09-AF26-BAE66A42CC91"
+private let v8Tab1Left = "558A5221-02BD-42F4-AE12-7EF534EDD8DD"
+
+// MARK: - Terminal V8 (1.4.0)
+
+private let v8Data = Data(base64Encoded: """
+    YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QD05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGkCwwRElUkbnVsbNINDg8QVGRhdGFWJGNsYXNzgAKAA08RCX1icGxpc3QwMNQAAQACAAMABAAFAAYABwAKWCR2ZXJzaW9uWSRhcmNoaXZlclQkdG9wWCRvYmplY3RzEgABhqBfEA9OU0tleWVkQXJjaGl2ZXLRAAgACVV2YWx1ZYABrxBHAAsADAAfACAAIQAiACMAJAAlACYAJwAvADAAMQAyADgAOQBFAEYARwBIAEkATwBQAFYAVwBYAF8AYABmAGwAbQBzAHQAeAB5AH4AigCLAIwAjQCOAJYAnACoAK4AtAC1ALYAvADCAMMAyQDKAM4A2gDbANwA5ADqAPYA/AECAQMBBAEKARABEQEXARgBHFUkbnVsbNMADQAOAA8AEAAXAB5XTlMua2V5c1pOUy5vYmplY3RzViRjbGFzc6YAEQASABMAFAAVABaAAoADgASABYAGgAemABgAGQAaABsAHAAdgAiACYAKgCKAI4ANgBpeZm9jdXNlZFN1cmZhY2VYdGFiQ29sb3Jbc3VyZmFjZVRyZWVddGl0bGVPdmVycmlkZVR0YWJzXmFjdGl2ZVRhYkluZGV4UnY4EAfTAA0ADgAPACgAKwAeogApACqAC4AMogAdAC2ADYAOgBpXdmVyc2lvblRyb290EAHTAA0ADgAPADMANQAeoQA0gA+hADaAEIAaVXNwbGl00wANAA4ADwA6AD8AHqQAOwA8AD0APoARgBKAE4AUpABAAEEAQgBDgBWAG4AcgB+AGlVyaWdodFVyYXRpb1RsZWZ0WWRpcmVjdGlvbtMADQAOAA8ASgBMAB6hAEuAFqEATYAXgBpUdmlld9MADQAOAA8AUQBTAB6hAFKAGKEAVIAZgBpSaWRfECRFNENGQjA0MS0zMkMxLTQ4OEItOTExNC1CNUY3OTJGOTc3OUHSAFkAWgBbAFxaJGNsYXNzbmFtZVgkY2xhc3Nlc18QE05TTXV0YWJsZURpY3Rpb25hcnmjAFsAXQBeXE5TRGljdGlvbmFyeVhOU09iamVjdCM/4AAAAAAAANMADQAOAA8AYQBjAB6hAEuAFqEAZIAdgBrTAA0ADgAPAGcAaQAeoQBSgBihAGqAHoAaXxAkNTU4QTUyMjEtMDJCRC00MkY0LUFFMTItN0VGNTM0RUREOERE0wANAA4ADwBuAHAAHqEAb4AgoQBxgCGAGlpob3Jpem9udGFs0wANAA4ADwB1AHYAHqCggBpWc2Vjb25k0gAOAA8AegB9ogB7AHyAJIA2gEbTAA0ADgAPAH8AhAAepACAAIEAEwASgCWAJoAEgAOkAIUAhgCHAB2AJ4AogCmADYAaXXRpdGxlT3ZlcnJpZGVeZm9jdXNlZFN1cmZhY2VVZmlyc3RUdGFiMNMADQAOAA8AjwCSAB6iACkAKoALgAyiAB0AlIANgCqAGtMADQAOAA8AlwCZAB6hADSAD6EAmoArgBrTAA0ADgAPAJ0AogAepAA7ADwAPQA+gBGAEoATgBSkAKMApAClAKaALIAvgDCAM4Aa0wANAA4ADwCpAKsAHqEAS4AWoQCsgC2AGtMADQAOAA8ArwCxAB6hAFKAGKEAsoAugBpfECQyRTU3NDk0Ny0zOTg2LTRCQkUtQTczQS01NzkzMjg4RjFFMzAjP+AAAAAAAADTAA0ADgAPALcAuQAeoQBLgBahALqAMYAa0wANAA4ADwC9AL8AHqEAUoAYoQDAgDKAGl8QJDNGQzVCM0M2LTVBMkItNEUwOS1BRjI2LUJBRTY2QTQyQ0M5MdMADQAOAA8AxADGAB6hAMWANKEAx4A1gBpaaG9yaXpvbnRhbNMADQAOAA8AywDMAB6goIAa0wANAA4ADwDPANQAHqQA0ADRABMAEoA3gDiABIADpAAbABgA1wAZgCKACIA5gAmAGl10aXRsZU92ZXJyaWRlXmZvY3VzZWRTdXJmYWNl0wANAA4ADwDdAOAAHqIAKQAqgAuADKIAHQDigA2AOoAa0wANAA4ADwDlAOcAHqEANIAPoQDogDuAGtMADQAOAA8A6wDwAB6kADsAPAA9AD6AEYASgBOAFKQA8QDyAPMA9IA8gD+AQIBDgBrTAA0ADgAPAPcA+QAeoQBLgBahAPqAPYAa0wANAA4ADwD9AP8AHqEAUoAYoQEAgD6AGl8QJEU0Q0ZCMDQxLTMyQzEtNDg4Qi05MTE0LUI1Rjc5MkY5Nzc5QSM/4AAAAAAAANMADQAOAA8BBQEHAB6hAEuAFqEBCIBBgBrTAA0ADgAPAQsBDQAeoQBSgBihAQ6AQoAaXxAkNTU4QTUyMjEtMDJCRC00MkY0LUFFMTItN0VGNTM0RUREOERE0wANAA4ADwESARQAHqEBE4BEoQEVgEWAGlpob3Jpem9udGFs0wANAA4ADwEZARoAHqCggBrSAFkAWgEdAR5eTlNNdXRhYmxlQXJyYXmjAR0BHwBeV05TQXJyYXkACAAZACIALAAxADoAPwBRAFYAXABeAO8A9QECAQoBFQEcASkBKwEtAS8BMQEzATUBQgFEAUYBSAFKAUwBTgFQAV8BaAF0AYIBhwGWAZkBmwGoAa0BrwGxAbYBuAG6AbwBxAHJAcsB2AHbAd0B4AHiAeQB6gH3AgACAgIEAgYCCAIRAhMCFQIXAhkCGwIhAicCLAI2AkMCRgJIAksCTQJPAlQCYQJkAmYCaQJrAm0CcAKXAqACqwK0AsoC0QLeAucC8AL9AwADAgMFAwcDCQMWAxkDGwMeAyADIgNJA1YDWQNbA14DYANiA20DegN7A3wDfgOFA44DkwOVA5cDmQOmA68DsQOzA7UDtwPAA8IDxAPGA8gDygPYA+cD7QPyA/8EBAQGBAgEDQQPBBEEEwQgBCMEJQQoBCoELAQ5BEIERARGBEgESgRTBFUEVwRZBFsEXQRqBG0EbwRyBHQEdgSDBIYEiASLBI0EjwS2BL8EzATPBNEE1ATWBNgE5QToBOoE7QTvBPEFGAUlBSgFKgUtBS8FMQU8BUkFSgVLBU0FWgVjBWUFZwVpBWsFdAV2BXgFegV8BX4FjAWbBagFrQWvBbEFtgW4BboFvAXJBcwFzgXRBdMF1QXiBesF7QXvBfEF8wX8Bf4GAAYCBgQGBgYTBhYGGAYbBh0GHwYsBi8GMQY0BjYGOAZfBmgGdQZ4BnoGfQZ/BoEGjgaRBpMGlgaYBpoGwQbOBtEG0wbWBtgG2gblBvIG8wb0BvYG/wcOBxUAAAAAAAACAgAAAAAAAAEgAAAAAAAAAAAAAAAAAAAHHdETFFokY2xhc3NuYW1lXxAXQ29kYWJsZUJyaWRnZTxUZXJtaW5hbD4ACAARABoAJAApADIANwBJAEwAUQBTAFgAXgBjAGgAbwBxAHMJ9An3CgIAAAAAAAACAQAAAAAAAAAVAAAAAAAAAAAAAAAAAAAKHA==
+    """)!
 
 private extension TerminalRestorableTests {
     func archive<T: NSObject & NSSecureCoding>(_ obj: T, className: String?) throws -> Data {
