@@ -1532,6 +1532,36 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
     }
 
+    /// Open a saved tab as a native tab, for when the option was turned off
+    /// since it was saved. If AppKit won't attach the window we leave it as a
+    /// session of its own rather than dropping it.
+    func restoreNativeTab(
+        tree: SplitTree<Ghostty.SurfaceView>,
+        titleOverride: String?,
+        tabColor: TerminalTabColor?,
+        focusedSurface: UUID?,
+        relativeTo parent: NSWindow?,
+        ordered: NSWindow.OrderingMode
+    ) -> NSWindow? {
+        let controller = TerminalController(ghostty, withSurfaceTree: tree)
+        controller.isBackgroundOpaque = isBackgroundOpaque
+        controller.titleOverride = titleOverride
+        if let tabColor {
+            (controller.window as? TerminalWindow)?.tabColor = tabColor
+        }
+        if let focusedSurface {
+            controller.focusedSurface = tree.first { $0.id == focusedSurface }
+        }
+        let attached: Bool
+        if let parent, let window = controller.window {
+            attached = parent.addTabbedWindowSafely(window, ordered: ordered)
+        } else {
+            attached = false
+        }
+        controller.showWindowSafely(nil)
+        return attached ? controller.window : nil
+    }
+
     /// The current undo state for this controller
     var undoState: UndoState? {
         guard let window else { return nil }
@@ -2766,11 +2796,6 @@ extension TerminalController {
                     position: frame.map { NSPoint(x: $0.minX, y: $0.maxY) },
                     inheritBackgroundOpacity: isBackgroundOpaque,
                     restoringFrame: frame)
-
-                // With native tabs the window owns the color, so it has to come
-                // off the tab. With our own tabs the window reads it back off
-                // the tab and this writes the same value it already has.
-                (restored.window as? TerminalWindow)?.tabColor = tab.tabColor
                 return restored
             }
 
@@ -2786,7 +2811,6 @@ extension TerminalController {
                 ghostty,
                 adopting: tab,
                 inheritBackgroundOpacity: destination.isBackgroundOpaque)
-            (restored.window as? TerminalWindow)?.tabColor = tab.tabColor
             if let parent = destination.window, let window = restored.window {
                 parent.addTabbedWindowSafely(
                     window, ordered: precedesNeighbor ? .below : .above)
