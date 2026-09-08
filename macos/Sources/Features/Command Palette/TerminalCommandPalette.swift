@@ -146,37 +146,44 @@ struct TerminalCommandPaletteView: View {
         TerminalController.all.flatMap { controller -> [CommandOption] in
             guard let window = controller.window else { return [] }
 
-            let color = (window as? TerminalWindow)?.tabColor
-            let displayColor = color != TerminalTabColor.none ? color : nil
+            // Every tab, not just the one on screen, and each one named and
+            // colored for itself. With native tabs the window is the tab and
+            // the color is still the window's.
+            return controller.tabs.flatMap { tab -> [CommandOption] in
+                let color = controller.usesNonNativeTabs
+                    ? tab.tabColor
+                    : ((window as? TerminalWindow)?.tabColor ?? .none)
+                let displayColor = color != TerminalTabColor.none ? color : nil
 
-            return controller.surfaceTree.map { surface in
-                let terminalTitle = surface.title.isEmpty ? window.title : surface.title
-                let displayTitle: String
-                if let override = controller.titleOverride, !override.isEmpty {
-                    displayTitle = override
-                } else if !terminalTitle.isEmpty {
-                    displayTitle = terminalTitle
-                } else {
-                    displayTitle = "Untitled"
-                }
-                let pwd = surface.pwd?.abbreviatedPath
-                let subtitle: String? = if let pwd, !displayTitle.contains(pwd) {
-                    pwd
-                } else {
-                    nil
-                }
+                return tab.surfaces.map { surface in
+                    let terminalTitle = surface.title.isEmpty ? tab.title : surface.title
+                    let displayTitle: String
+                    if let override = tab.titleOverride, !override.isEmpty {
+                        displayTitle = override
+                    } else if !terminalTitle.isEmpty {
+                        displayTitle = terminalTitle
+                    } else {
+                        displayTitle = "Untitled"
+                    }
+                    let pwd = surface.pwd?.abbreviatedPath
+                    let subtitle: String? = if let pwd, !displayTitle.contains(pwd) {
+                        pwd
+                    } else {
+                        nil
+                    }
 
-                return CommandOption(
-                    title: "Focus: \(displayTitle)",
-                    subtitle: subtitle,
-                    leadingIcon: "rectangle.on.rectangle",
-                    leadingColor: displayColor?.displayColor.map { Color($0) },
-                    sortKey: ObjectIdentifier(surface)
-                ) {
-                    NotificationCenter.default.post(
-                        name: Ghostty.Notification.ghosttyPresentTerminal,
-                        object: surface
-                    )
+                    return CommandOption(
+                        title: "Focus: \(displayTitle)",
+                        subtitle: subtitle,
+                        leadingIcon: "rectangle.on.rectangle",
+                        leadingColor: displayColor?.displayColor.map { Color($0) },
+                        sortKey: ObjectIdentifier(surface)
+                    ) {
+                        NotificationCenter.default.post(
+                            name: Ghostty.Notification.ghosttyPresentTerminal,
+                            object: surface
+                        )
+                    }
                 }
             }
         }

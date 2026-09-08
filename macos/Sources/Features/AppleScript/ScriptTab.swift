@@ -21,14 +21,26 @@ final class ScriptTab: NSObject {
     /// This can become `nil` if the tab closes while a script is running.
     private weak var controller: BaseTerminalController?
 
+    /// The tab within `controller`, when the controller owns its own tabs
+    /// (`macos-non-native-tabs`). With native tabbing a controller IS a tab,
+    /// so this is nil and everything reads through the controller.
+    private weak var tab: TerminalTab?
+
     /// Called by `ScriptWindow.tabs` / `ScriptWindow.selectedTab`.
     ///
     /// The ID is computed once so object specifiers built from this instance keep
     /// a consistent tab identity.
-    init(window: ScriptWindow, controller: BaseTerminalController) {
-        self.stableID = Self.stableID(controller: controller)
+    init(window: ScriptWindow, controller: BaseTerminalController, tab: TerminalTab? = nil) {
+        self.stableID = Self.stableID(controller: controller, tab: tab)
         self.window = window
         self.controller = controller
+        self.tab = tab
+    }
+
+    /// The surfaces in this tab.
+    private var surfaces: [Ghostty.SurfaceView] {
+        if let tab { return tab.surfaces }
+        return controller?.allSurfaces ?? []
     }
 
     /// Exposed as the AppleScript `id` property.
@@ -44,6 +56,7 @@ final class ScriptTab: NSObject {
     @objc(title)
     var title: String {
         guard NSApp.isAppleScriptEnabled else { return "" }
+        if let tab { return tab.title }
         return controller?.window?.title ?? ""
     }
 
@@ -54,7 +67,7 @@ final class ScriptTab: NSObject {
     var index: Int {
         guard NSApp.isAppleScriptEnabled else { return 0 }
         guard let controller else { return 0 }
-        return window?.tabIndex(for: controller) ?? 0
+        return window?.tabIndex(for: controller, tab: tab) ?? 0
     }
 
     /// Exposed as the AppleScript `selected` property.
@@ -64,7 +77,7 @@ final class ScriptTab: NSObject {
     var selected: Bool {
         guard NSApp.isAppleScriptEnabled else { return false }
         guard let controller else { return false }
-        return window?.tabIsSelected(controller) ?? false
+        return window?.tabIsSelected(controller, tab: tab) ?? false
     }
 
     /// Exposed as the AppleScript `focused terminal` property.
@@ -73,6 +86,11 @@ final class ScriptTab: NSObject {
     @objc(focusedTerminal)
     var focusedTerminal: ScriptTerminal? {
         guard NSApp.isAppleScriptEnabled else { return nil }
+        if let tab {
+            guard let surface = tab.focusedSurface ?? tab.surfaces.first else { return nil }
+            return ScriptTerminal(surfaceView: surface)
+        }
+
         guard let controller else { return nil }
         guard let surface = controller.focusedSurface,
               controller.surfaceTree.contains(surface)
@@ -99,17 +117,14 @@ final class ScriptTab: NSObject {
     @objc(terminals)
     var terminals: [ScriptTerminal] {
         guard NSApp.isAppleScriptEnabled else { return [] }
-        guard let controller else { return [] }
-        return (controller.surfaceTree.root?.leaves() ?? [])
-            .map(ScriptTerminal.init)
+        return surfaces.map(ScriptTerminal.init)
     }
 
     /// Enables unique-ID lookup for `terminals` references on a tab.
     @objc(valueInTerminalsWithUniqueID:)
     func valueInTerminals(uniqueID: String) -> ScriptTerminal? {
         guard NSApp.isAppleScriptEnabled else { return nil }
-        guard let controller else { return nil }
-        return (controller.surfaceTree.root?.leaves() ?? [])
+        return surfaces
             .first(where: { $0.id.uuidString == uniqueID })
             .map(ScriptTerminal.init)
     }
@@ -118,6 +133,14 @@ final class ScriptTab: NSObject {
     @objc(handleSelectTabCommand:)
     func handleSelectTab(_ command: NSScriptCommand) -> Any? {
         guard NSApp.validateScript(command: command) else { return nil }
+
+        // We only ever hold a tab when the controller owns its own tabs, which
+        // is the only kind of controller that can select one.
+        if let tab, let controller = controller as? TerminalController {
+            controller.selectTab(tab)
+            controller.window?.makeKeyAndOrderFront(nil)
+            return nil
+        }
 
         guard let tabContainerWindow = parentWindow else {
             command.scriptErrorNumber = errAEEventFailed
@@ -141,7 +164,7 @@ final class ScriptTab: NSObject {
         }
 
         if let managedTerminalController = tabController as? TerminalController {
-            managedTerminalController.closeTabImmediately(registerRedo: false)
+            managedTerminalController.closeTabImmediately(tab, registerRedo: false)
             return nil
         }
 
@@ -180,7 +203,8 @@ extension ScriptTab {
     ///
     /// Tab identity belongs to `ScriptTab`, so both tab creation and tab ID
     /// lookups in `ScriptWindow` call this helper.
-    static func stableID(controller: BaseTerminalController) -> String {
-        "tab-\(ObjectIdentifier(controller).hexString)"
+    static func stableID(controller: BaseTerminalController, tab: TerminalTab? = nil) -> String {
+        if let tab { return "tab-\(tab.id.uuidString)" }
+        return "tab-\(ObjectIdentifier(controller).hexString)"
     }
 }

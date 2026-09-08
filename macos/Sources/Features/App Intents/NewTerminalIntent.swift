@@ -105,12 +105,17 @@ struct NewTerminalIntent: AppIntent {
                 NSApp.activate(ignoringOtherApps: true)
             }
         }
+
+        // A parent in a background tab has no window of its own, so we ask who
+        // owns it rather than reading its view hierarchy.
+        let parentWindow = parent.flatMap { BaseTerminalController.controller(owning: $0)?.window }
+
         switch location {
         case .window:
             let newController = TerminalController.newWindow(
                 ghostty,
                 withBaseConfig: config,
-                withParent: parent?.window)
+                withParent: parentWindow)
             if let view = newController.surfaceTree.root?.leftmostLeaf() {
                 return .result(value: await TerminalEntity(view: view))
             }
@@ -118,7 +123,7 @@ struct NewTerminalIntent: AppIntent {
         case .tab:
             let newController = TerminalController.newTab(
                 ghostty,
-                from: parent?.window,
+                from: parentWindow,
                 withBaseConfig: config)
             if let view = newController?.surfaceTree.root?.leftmostLeaf() {
                 return .result(value: await TerminalEntity(view: view))
@@ -126,7 +131,7 @@ struct NewTerminalIntent: AppIntent {
 
         case .splitLeft, .splitRight, .splitUp, .splitDown:
             guard let parent,
-                  let controller = parent.window?.windowController as? BaseTerminalController else {
+                  let controller = BaseTerminalController.controller(owning: parent) else {
                 throw GhosttyIntentError.surfaceNotFound
             }
 

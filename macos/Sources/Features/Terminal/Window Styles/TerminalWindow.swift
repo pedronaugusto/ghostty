@@ -59,14 +59,40 @@ class TerminalWindow: NSWindow {
         windowController as? TerminalController
     }
 
+    /// Backing storage for ``tabColor`` when the window is the tab, i.e. with
+    /// native tabs. With non-native tabs the active ``TerminalTab`` owns it instead.
+    private var windowTabColor: TerminalTabColor = .none
+
     /// The color assigned to this window's tab. Setting this updates the tab color indicator
     /// and marks the window's restorable state as dirty.
-    var tabColor: TerminalTabColor = .none {
-        didSet {
-            guard tabColor != oldValue else { return }
-            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
+    ///
+    /// With non-native tabs one window holds many tabs, so the color belongs to the
+    /// tab rather than the window. This forwards to the active tab in that case
+    /// so every existing caller -- restoration, undo, the command palette and
+    /// the tab context menu -- keeps working unchanged.
+    var tabColor: TerminalTabColor {
+        get { nonNativeActiveTab?.tabColor ?? windowTabColor }
+        set {
+            guard tabColor != newValue else { return }
+            if let tab = nonNativeActiveTab {
+                tab.tabColor = newValue
+            } else {
+                windowTabColor = newValue
+            }
+            tabColorIndicator.rootView = TabColorIndicatorView(tabColor: newValue)
             invalidateRestorableState()
         }
+    }
+
+    /// The tab that owns this window's color, or nil when the window itself does.
+    private var nonNativeActiveTab: TerminalTab? {
+        guard let terminalController, terminalController.usesNonNativeTabs else { return nil }
+        return terminalController.activeTab
+    }
+
+    /// Refresh the color indicator after the active tab changes.
+    func tabColorDidChange() {
+        tabColorIndicator.rootView = TabColorIndicatorView(tabColor: tabColor)
     }
 
     // MARK: NSWindow Overrides
@@ -99,7 +125,13 @@ class TerminalWindow: NSWindow {
         // again. I'm not sure why this is required. If you don't do this, then
         // tabs restore as separate windows.
         tabbingMode = .preferred
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+
+            // Our controller sets `.disallowed` in `windowDidLoad`, which runs
+            // before this tick. Restoring `.automatic` here would hand tabbing
+            // back to AppKit and undo non-native tabs entirely.
+            if self.terminalController?.usesNonNativeTabs ?? false { return }
             self.tabbingMode = .automatic
         }
 

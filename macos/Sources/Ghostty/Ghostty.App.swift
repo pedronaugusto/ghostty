@@ -1264,7 +1264,8 @@ extension Ghostty {
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
 
                     // See gotoTab for notes on this check.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView),
+                          controller.tabCount > 1 else { return false }
 
                     NotificationCenter.default.post(
                         name: .ghosttyMoveTab,
@@ -1321,7 +1322,12 @@ extension Ghostty {
 
                     // Similar to goto_split (see comment there) about our performability,
                     // we should make this more accurate later.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    //
+                    // Ask the owning controller rather than reading the window's
+                    // tab group: with `macos-non-native-tabs` there is no tab
+                    // group even when the window has many tabs.
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView),
+                          controller.tabCount > 1 else { return false }
 
                     NotificationCenter.default.post(
                         name: Notification.ghosttyGotoTab,
@@ -1840,10 +1846,12 @@ extension Ghostty {
                 let titleOverride = title.isEmpty ? nil : title
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
-                guard let window = surfaceView.window,
-                      let controller = window.windowController as? BaseTerminalController
+
+                // A surface in a background tab has no window of its own, so we
+                // ask who owns it rather than reading its view hierarchy.
+                guard let controller = BaseTerminalController.controller(owning: surfaceView)
                 else { return false }
-                controller.titleOverride = titleOverride
+                controller.setTitleOverride(titleOverride, for: surfaceView)
                 return true
 
             default:
@@ -1861,9 +1869,13 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return false }
                 guard let surfaceView = self.surfaceView(from: surface) else { return false }
-                // We handle this when the window is visible and timetime_ms is greater than 0,
-                // which will rule out exit codes on launch
-                guard surfaceView.window != nil, v.timetime_ms > 0 else { return false }
+                // We handle this when the surface is in a window and timetime_ms is
+                // greater than 0, which will rule out exit codes on launch. A surface
+                // in a background tab has no window of its own, so we ask who owns it
+                // rather than reading its view hierarchy.
+                guard BaseTerminalController.controller(owning: surfaceView) != nil,
+                      v.timetime_ms > 0
+                else { return false }
                 guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return false }
                 surfaceView.setChildExitedMessage(.init(v, threshold: config.abnormalCommandExitRuntime))
                 return true
@@ -1926,10 +1938,9 @@ extension Ghostty {
                 case GHOSTTY_TARGET_SURFACE:
                     guard let surface = target.target.surface else { return false }
                     guard let surfaceView = self.surfaceView(from: surface) else { return false }
-                    guard let window = surfaceView.window,
-                          let controller = window.windowController as? BaseTerminalController
+                    guard let controller = BaseTerminalController.controller(owning: surfaceView)
                     else { return false }
-                    controller.promptTabTitle()
+                    controller.promptTabTitle(for: surfaceView)
                     return true
 
                 default:
