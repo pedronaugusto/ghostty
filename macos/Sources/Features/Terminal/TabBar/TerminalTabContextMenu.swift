@@ -26,6 +26,11 @@ struct TerminalTabContextMenu: View {
             Button("Close Tabs to the Right") { model.closeToTheRight(tab) }
         }
 
+        if model.tabs.count > 1 {
+            Divider()
+            Button("Move Tab to New Window") { model.moveToNewWindow(tab) }
+        }
+
         Divider()
 
         Button("Rename Tab...") { model.rename(tab) }

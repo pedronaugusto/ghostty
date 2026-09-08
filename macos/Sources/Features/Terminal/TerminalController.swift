@@ -205,6 +205,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             name: .ghosttyCloseWindow,
             object: nil
         )
+        center.addObserver(
+            self,
+            selector: #selector(ghosttyTabDragEndedNoTarget(_:)),
+            name: .ghosttyTabDragEndedNoTarget,
+            object: nil)
     }
 
     required init?(coder: NSCoder) {
@@ -628,6 +633,13 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         let controller = TerminalController(ghostty, adopting: tab)
         controller.isBackgroundOpaque = inheritBackgroundOpacity
         controller.showWindowSafely(nil)
+
+        // With native tabs the window owns the color, so it has to come off the
+        // tab. With our own tabs the window reads it back off the tab and this
+        // writes the value it already holds. Doing it here rather than at each
+        // call site is what makes tearing a tab off keep its color when the
+        // option was turned off after the color was set.
+        (controller.window as? TerminalWindow)?.tabColor = tab.tabColor
         controller.scheduleInitialPresentation {
             guard let window = controller.window else { return }
             if let frame {
@@ -1677,6 +1689,24 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         syncTabBarVisibility()
     }
 
+    /// Move a tab out into a window of its own.
+    ///
+    /// This is what AppKit's `moveTabToNewWindow:` does for native tabs. That
+    /// selector is disabled without a tab group, so with non-native tabs the Window
+    /// menu item and the tab context menu come here instead.
+    func moveTabToNewWindow(_ tab: TerminalTab, position: NSPoint? = nil) {
+        guard usesNonNativeTabs, tabs.count > 1,
+              let index = tabs.firstIndex(where: { $0 === tab }) else { return }
+
+        let location = TabUndoLocation(controller: self, tab: tab, index: index)
+        let created = TerminalController.newWindow(
+            ghostty,
+            adopting: tab,
+            position: position,
+            inheritBackgroundOpacity: isBackgroundOpaque)
+        created.registerUndoForTabMove(tab, to: location, action: "Move Tab to New Window")
+    }
+
     /// Install or remove the tab bar per `window-show-tab-bar`.
     ///
     /// The accessory is added and removed rather than hidden: an
@@ -1719,6 +1749,47 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         if derivedConfig.macosTitlebarStyle == .tabs {
             (window as? TerminalWindow)?.setTitleHiddenForTabBar(visible)
         }
+    }
+
+    /// Pull every other Ghostty-tabbed window's tabs into this one.
+    ///
+    /// AppKit's "Merge All Windows" works on tab groups, which don't exist
+    /// here, so this is the equivalent for non-native tabs. Windows using native
+    /// tabs are left alone: merging those would mean changing their tab style.
+    func mergeAllWindows() {
+        guard usesNonNativeTabs else { return }
+
+        let others = NSApp.windows
+            .compactMap { $0.windowController as? TerminalController }
+            .filter { $0 !== self && $0.usesNonNativeTabs }
+        guard !others.isEmpty else { return }
+
+        // Merging is not undoable with native tabs either, so there is nothing
+        // to register here.
+        let selected = activeTab
+        for other in others {
+            for tab in other.tabs {
+                other.detach(tab)
+                insert(tab, at: tabs.count)
+            }
+        }
+
+        // Every insert selects what it inserted, so put the selection back on
+        // the tab the user was actually looking at.
+        if let selected { selectTab(selected) }
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Window menu items for the two tab commands AppKit only offers when it
+    /// owns the tabs. They're hidden entirely with native tabs,
+    /// where AppKit injects its own into this same menu.
+    @IBAction func moveGhosttyTabToNewWindow(_ sender: Any?) {
+        guard let activeTab else { return }
+        moveTabToNewWindow(activeTab)
+    }
+
+    @IBAction func mergeAllGhosttyWindows(_ sender: Any?) {
+        mergeAllWindows()
     }
 
     // Shows the "+" button in the tab bar, responds to that click.
@@ -2837,6 +2908,17 @@ extension TerminalController {
         invalidateRestorableState()
     }
 
+    /// A tab dragged out of every window becomes a window of its own, which is
+    /// what dragging a native tab out of the bar does.
+    @objc func ghosttyTabDragEndedNoTarget(_ notification: Notification) {
+        guard let tab = notification.object as? TerminalTab else { return }
+        guard Self.controller(owning: tab) === self, tabs.count > 1 else { return }
+
+        moveTabToNewWindow(
+            tab,
+            position: notification.userInfo?[Notification.Name.ghosttyTabDragEndedNoTargetPointKey] as? NSPoint)
+    }
+
     // MARK: Tabs: Split Tree Management
 
     /// The bookkeeping `surfaceTree`'s `didSet` does, for a tab that isn't the
@@ -3044,6 +3126,15 @@ extension TerminalController {
 extension TerminalController {
     override func validateMenuItem(_ item: NSMenuItem) -> Bool {
         switch item.action {
+        case #selector(moveGhosttyTabToNewWindow):
+            return usesNonNativeTabs && tabs.count > 1
+
+        case #selector(mergeAllGhosttyWindows):
+            return usesNonNativeTabs && NSApp.windows.contains {
+                guard let other = $0.windowController as? TerminalController else { return false }
+                return other !== self && other.usesNonNativeTabs
+            }
+
         case #selector(closeTabsOnTheRight(_:)):
             if usesNonNativeTabs {
                 return tabs.indices.contains { $0 > activeTabIndex }

@@ -119,6 +119,7 @@ class TerminalWindow: NSWindow {
         ) { [weak self] n in
             guard let self, let menu = n.object as? NSMenu else { return }
             self.configureTabContextMenuIfNeeded(menu)
+            self.configureWindowMenuIfNeeded(menu)
         }
 
         // This is required so that window restoration properly creates our tabs
@@ -276,6 +277,12 @@ class TerminalWindow: NSWindow {
     }
 
     override func mergeAllWindows(_ sender: Any?) {
+        // AppKit merges tab groups, which don't exist with non-native tabs.
+        if let terminalController, terminalController.usesNonNativeTabs {
+            terminalController.mergeAllWindows()
+            return
+        }
+
         super.mergeAllWindows(sender)
 
         // It takes an event loop cycle to merge all the windows so we set a
@@ -851,6 +858,76 @@ extension TerminalWindow {
     private static let tabColorSeparatorIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorSeparator")
 
     private static let tabColorPaletteIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.tabColorPalette")
+
+    private static let moveTabToNewWindowMenuItemIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.moveTabToNewWindowMenuItem")
+    private static let mergeAllWindowsMenuItemIdentifier = NSUserInterfaceItemIdentifier("com.mitchellh.ghostty.mergeAllWindowsMenuItem")
+
+    /// Adds "Move Tab to New Window" and "Merge All Windows" to the Window menu
+    /// when Ghostty owns the tabs.
+    ///
+    /// AppKit injects both itself, but only while window tabbing is available.
+    /// With non-native tabs `tabbingMode` is `.disallowed`, so they never appear and
+    /// the commands would be unreachable from the menu bar. Building them as the
+    /// menu opens, rather than shipping them in the nib, is what keeps them from
+    /// duplicating AppKit's in the styles where AppKit still supplies them.
+    func configureWindowMenuIfNeeded(_ menu: NSMenu) {
+        guard menu === NSApp.windowsMenu else { return }
+        Self.configureWindowMenu(menu, target: Self.windowMenuTarget(for: NSApp.keyWindow))
+    }
+
+    /// The controller the Window-menu commands act on.
+    ///
+    /// Every window sees the menu notification, so this depends only on which
+    /// window is key, never on which one is asking -- otherwise the answer
+    /// changes with the order the windows were made. Asking `self` left the
+    /// commands pointing at the last terminal once something that is not one of
+    /// ours -- the About panel, say -- had taken key, where they stayed enabled
+    /// and acted on a window the user was no longer looking at.
+    static func windowMenuTarget(for keyWindow: NSWindow?) -> AnyObject? {
+        guard let controller = (keyWindow as? TerminalWindow)?.terminalController,
+              controller.usesNonNativeTabs else { return nil }
+        return controller
+    }
+
+    /// Rebuilds the two items in `menu`, adding them for `target` or removing
+    /// them when it is nil.
+    ///
+    /// Separate from the notification plumbing above so the placement and the
+    /// deduplication can be tested without a window.
+    static func configureWindowMenu(_ menu: NSMenu, target: AnyObject?) {
+        menu.removeItems(withIdentifiers: [
+            Self.moveTabToNewWindowMenuItemIdentifier,
+            Self.mergeAllWindowsMenuItemIdentifier,
+        ])
+
+        guard let terminalController = target else { return }
+
+        // Sit with the other window-level commands, above the separator that
+        // precedes the split commands. AppKit keeps the window list at the very
+        // bottom, so appending would land under it.
+        let moveOut = NSMenuItem(
+            title: "Move Tab to New Window",
+            action: #selector(TerminalController.moveGhosttyTabToNewWindow(_:)),
+            keyEquivalent: "")
+        moveOut.identifier = Self.moveTabToNewWindowMenuItemIdentifier
+        moveOut.target = terminalController
+        moveOut.setImageIfDesired(systemSymbolName: "macwindow.badge.plus")
+        guard menu.insertItem(
+            moveOut,
+            after: NSSelectorFromString("toggleVisibility:")) != nil
+        else { return }
+
+        let merge = NSMenuItem(
+            title: "Merge All Windows",
+            action: #selector(TerminalController.mergeAllGhosttyWindows(_:)),
+            keyEquivalent: "")
+        merge.identifier = Self.mergeAllWindowsMenuItemIdentifier
+        merge.target = terminalController
+        merge.setImageIfDesired(systemSymbolName: "square.stack")
+        menu.insertItem(
+            merge,
+            after: #selector(TerminalController.moveGhosttyTabToNewWindow(_:)))
+    }
 
     func configureTabContextMenuIfNeeded(_ menu: NSMenu) {
         guard isTabContextMenu(menu) else { return }

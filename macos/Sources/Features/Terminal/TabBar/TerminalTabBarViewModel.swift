@@ -170,6 +170,10 @@ class TerminalTabBarViewModel: ObservableObject {
         return index + 1 < tabs.count
     }
 
+    func moveToNewWindow(_ tab: TerminalTab) {
+        controller?.moveTabToNewWindow(tab)
+    }
+
     func rename(_ tab: TerminalTab) {
         guard let controller else { return }
         controller.selectTab(tab)

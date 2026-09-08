@@ -3414,9 +3414,10 @@ keybind: Keybinds = .{},
 /// `window-show-tab-bar` decides when it is shown.
 ///
 /// The macOS features built on window tabs are not available: "Show All Tabs",
-/// and the tab commands the system contributes to the Window menu. A tab
-/// dragged into another window's tab bar moves when it is dropped rather than
-/// being previewed in place as it is dragged.
+/// and the tab commands the system contributes to the Window menu. Ghostty
+/// supplies "Move Tab to New Window" and "Merge All Windows" in their place. A
+/// tab dragged into another window's tab bar moves when it is dropped rather
+/// than being previewed in place as it is dragged.
 ///
 /// The default value is `false`.
 ///
