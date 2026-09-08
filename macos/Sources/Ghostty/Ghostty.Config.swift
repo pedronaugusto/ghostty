@@ -234,6 +234,16 @@ extension Ghostty {
             return ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) ? v : nil
         }
 
+        var windowShowTabBar: WindowShowTabBar {
+            let defaultValue = WindowShowTabBar.auto
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>?
+            let key = "window-show-tab-bar"
+            guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            return WindowShowTabBar(rawValue: String(cString: ptr)) ?? defaultValue
+        }
+
         var windowNewTabPosition: String {
             guard let config = self.config else { return "" }
             var v: UnsafePointer<Int8>?
@@ -359,6 +369,16 @@ extension Ghostty {
             guard ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8))) else { return defaultValue }
             guard let ptr = v else { return defaultValue }
             return MacOSTitlebarStyle(rawValue: String(cString: ptr)) ?? defaultValue
+        }
+
+        /// Whether Ghostty implements tabs itself rather than using macOS
+        /// native window tabbing.
+        var macosNonNativeTabs: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "macos-non-native-tabs"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
         }
 
         var macosTitlebarProxyIcon: MacOSTitlebarProxyIcon {
@@ -915,6 +935,11 @@ extension Ghostty.Config {
     enum MacOSTitlebarStyle: String {
         static let `default` = MacOSTitlebarStyle.transparent
         case native, transparent, tabs, hidden
+    }
+
+    enum WindowShowTabBar: String {
+        static let `default` = WindowShowTabBar.auto
+        case always, auto, never
     }
 
     enum DragHandle: String {

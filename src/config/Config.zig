@@ -2329,10 +2329,14 @@ keybind: Keybinds = .{},
 ///
 ///  - `never`
 ///
-///    Never show the tab bar. Tabs are only accessible via the tab
-///    overview or by keybind actions.
+///    Never show the tab bar. Tabs are only accessible by keybind actions,
+///    and on Linux also via the tab overview.
 ///
-/// Currently only supported on Linux (GTK).
+/// On macOS this only applies to the tab bar Ghostty draws itself, i.e. with
+/// `macos-non-native-tabs`. Native tabs use the system tab bar, which follows
+/// the system behavior instead.
+///
+/// Available since: 1.2.0 on GTK, 1.4.0 on macOS
 @"window-show-tab-bar": WindowShowTabBar = .auto,
 
 /// Background color for the window titlebar. This only takes effect if
@@ -3297,15 +3301,20 @@ keybind: Keybinds = .{},
 /// using a new space. It's faster than the native fullscreen mode since it
 /// doesn't use animations.
 ///
-/// Important: tabs DO NOT WORK in this mode. Non-native fullscreen removes
-/// the titlebar and macOS native tabs require the titlebar. If you use tabs,
-/// you should not use this mode.
+/// Important: macOS native tabs DO NOT WORK in this mode. Non-native
+/// fullscreen removes the titlebar and macOS native tabs require the titlebar.
+/// If you use native tabs, you should not use this mode.
 ///
-/// If you fullscreen a window with tabs, the currently focused tab will
+/// If you fullscreen a window with native tabs, the currently focused tab will
 /// become fullscreen while the others will remain in a separate window in
 /// the background. You can switch to that window using normal window-switching
 /// keybindings such as command+tilde. When you exit fullscreen, the window
 /// will return to the tabbed state it was in before.
+///
+/// With `macos-non-native-tabs` a window keeps every tab it has, so they go
+/// fullscreen together and none is left behind. The tab bar is drawn in the
+/// titlebar, so it is not shown while the titlebar is gone, and comes back
+/// when you exit.
 ///
 /// Allowable values are:
 ///
@@ -3365,9 +3374,9 @@ keybind: Keybinds = .{},
 /// The "tabs" style is a completely custom titlebar that integrates the
 /// tab bar into the titlebar. This titlebar always matches the background
 /// color of the terminal. There are some limitations to this style:
-/// On macOS 13 and below, saved window state will not restore tabs correctly.
-/// macOS 14 does not have this issue and any other macOS version has not
-/// been tested.
+/// On macOS 13 and below, saved window state will not restore native tabs
+/// correctly. macOS 14 does not have this issue and any other macOS version
+/// has not been tested.
 ///
 /// The "hidden" style hides the titlebar. Unlike `window-decoration = none`,
 /// however, it does not remove the frame from the window or cause it to have
@@ -3385,6 +3394,36 @@ keybind: Keybinds = .{},
 ///
 /// Changing this option at runtime only applies to new windows.
 @"macos-titlebar-style": MacTitlebarStyle = .transparent,
+
+/// Use tabs drawn by Ghostty rather than macOS native window tabs.
+///
+/// macOS models a tab as a window that has been grouped with others, so a
+/// window with three tabs is three windows to the rest of the system. With
+/// this set to `true` a window is a single window however many tabs it holds,
+/// and Ghostty draws the tab bar itself.
+///
+/// This setting has no effect when `window-decoration = none` or
+/// `macos-titlebar-style = hidden`, because the tab bar is drawn in the
+/// titlebar and there isn't one. Those windows keep the tab behavior they have
+/// otherwise: native tabs with no decorations, and with a hidden titlebar no
+/// tabs at all, where a new tab opens a new window.
+///
+/// `macos-titlebar-style` otherwise decides where the tab bar goes. With
+/// `macos-titlebar-style = tabs` it is drawn in the titlebar beside the window
+/// buttons, and otherwise it gets its own row below the titlebar.
+/// `window-show-tab-bar` decides when it is shown.
+///
+/// The macOS features built on window tabs are not available: "Show All Tabs",
+/// and the tab commands the system contributes to the Window menu. A tab
+/// dragged into another window's tab bar moves when it is dropped rather than
+/// being previewed in place as it is dragged.
+///
+/// The default value is `false`.
+///
+/// Changing this option at runtime only applies to new windows.
+///
+/// Available since: 1.4.0
+@"macos-non-native-tabs": bool = false,
 
 /// Whether the proxy icon in the macOS titlebar is visible. The proxy icon
 /// is the icon that represents the folder of the current working directory.
