@@ -106,6 +106,26 @@ struct ConfigTests {
         #expect(config.macosTitlebarStyle == expected)
     }
 
+    @Test(arguments: [
+        ("", false),
+        ("macos-non-native-tabs = false", false),
+        ("macos-non-native-tabs = true", true),
+    ])
+    func macosNonNativeTabs(source: String, expected: Bool) throws {
+        let config = try TemporaryConfig(source)
+        #expect(config.macosNonNativeTabs == expected)
+    }
+
+    @Test(arguments: [
+        ("always", Ghostty.Config.WindowShowTabBar.always),
+        ("auto", Ghostty.Config.WindowShowTabBar.auto),
+        ("never", Ghostty.Config.WindowShowTabBar.never),
+    ])
+    func windowShowTabBarValues(raw: String, expected: Ghostty.Config.WindowShowTabBar) throws {
+        let config = try TemporaryConfig("window-show-tab-bar = \(raw)")
+        #expect(config.windowShowTabBar == expected)
+    }
+
     @Test func resizeOverlayDefaultsToAfterFirst() throws {
         let config = try TemporaryConfig("")
         #expect(config.resizeOverlay == .after_first)
